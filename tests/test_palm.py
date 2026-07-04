@@ -1,0 +1,214 @@
+"""Tests for gesture_mouse.palm (PALM-mode system gestures).
+
+Builds synthetic LandmarkFrame sequences inline (no shared helpers): frames
+are constructed so the palm centroid (mean of landmarks 0,5,9,13,17) sits
+exactly on the INDEX_MCP anchor and the five fingertips sit at distance
+m * scale from it, making the spread metric exact.
+"""
+from __future__ import annotations
+
+import pytest
+
+from gesture_mouse.config import DEFAULT_BINDINGS, PalmConfig
+from gesture_mouse.palm import PalmDetector
+from gesture_mouse.types import FINGER_TIPS, LandmarkFrame, Phase, Point
+
+FRAME_W, FRAME_H = 640, 480
+SCALE = 100.0
+STEP_MS = 33.0  # ~30 fps
+
+# Offsets for the palm-centroid landmarks (0,5,9,13,17); they sum to zero so
+# the centroid lands exactly on the anchor, and index 5 IS the anchor.
+_BASE_OFFSETS = {0: (0.0, 40.0), 5: (0.0, 0.0), 9: (20.0, 0.0),
+                 13: (-20.0, 0.0), 17: (0.0, -40.0)}
+# Five unit vectors (pentagon) for fingertip placement around the centroid.
+_TIP_DIRS = [(1.0, 0.0), (0.309, -0.951), (-0.809, -0.588),
+             (-0.809, 0.588), (0.309, 0.951)]
+
+
+def make_frame(ts_ms: float, x: float, y: float, m: float = 1.0,
+               hand: bool = True) -> LandmarkFrame:
+    if not hand:
+        return LandmarkFrame(ts_ms=ts_ms, handedness=None, landmarks=None,
+                             img_w=FRAME_W, img_h=FRAME_H, confidence=0.0,
+                             scale=0.0, source="test")
+    pts = [Point(x, y)] * 21
+    for idx, (ox, oy) in _BASE_OFFSETS.items():
+        pts[idx] = Point(x + ox, y + oy)
+    r = m * SCALE
+    for tip, (ux, uy) in zip(FINGER_TIPS, _TIP_DIRS):
+        pts[tip] = Point(x + ux * r, y + uy * r)
+    return LandmarkFrame(ts_ms=ts_ms, handedness="Right", landmarks=tuple(pts),
+                         img_w=FRAME_W, img_h=FRAME_H, confidence=0.9,
+                         scale=SCALE, source="test")
+
+
+def feed(det: PalmDetector, steps):
+    """steps: iterable of (frame, open_palm); returns all emitted intents."""
+    intents = []
+    for frame, open_palm in steps:
+        intents.extend(det.update(frame, open_palm))
+    return intents
+
+
+def swipe_steps(direction: str, t0: float = 0.0, x0: float = 320.0,
+                y0: float = 240.0, n_hold: int = 3, n_move: int = 7,
+                step_px: float = 33.0):
+    """Open-palm hold then fast unidirectional move (~1000 px/s)."""
+    ux, uy = {"left": (-1, 0), "right": (1, 0),
+              "up": (0, -1), "down": (0, 1)}[direction]
+    steps = []
+    for i in range(n_hold):
+        steps.append((make_frame(t0 + i * STEP_MS, x0, y0), True))
+    for i in range(1, n_move + 1):
+        ts = t0 + (n_hold - 1 + i) * STEP_MS
+        steps.append((make_frame(ts, x0 + ux * step_px * i,
+                                 y0 + uy * step_px * i), True))
+    return steps
+
+
+def default_detector() -> PalmDetector:
+    return PalmDetector(PalmConfig(), dict(DEFAULT_BINDINGS))
+
+
+@pytest.mark.parametrize("direction,expected", [
+    ("left", "space_next"),
+    ("right", "space_prev"),
+    ("up", "mission_control"),
+    ("down", "app_expose"),
+])
+def test_swipe_each_direction_fires_bound_intent_once(direction, expected):
+    det = default_detector()
+    intents = feed(det, swipe_steps(direction))
+    assert [i.name for i in intents] == [expected]
+    assert intents[0].phase is Phase.TRIGGER
+    assert intents[0].ts_ms > 0.0
+
+
+def test_swipe_refractory_blocks_immediate_repeat():
+    det = default_detector()
+    cfg = det.cfg
+    intents = feed(det, swipe_steps("left"))
+    assert len(intents) == 1
+    trigger_ts = intents[0].ts_ms
+
+    # Drop the pose (re-arm), then swipe again while still refractory.
+    t = trigger_ts + 3 * STEP_MS
+    intents += feed(det, [(make_frame(t, 320, 240), False)])
+    second = swipe_steps("left", t0=t + STEP_MS)
+    assert second[-1][0].ts_ms < trigger_ts + cfg.swipe_refractory_ms
+    intents += feed(det, second)
+    assert len(intents) == 1  # blocked by refractory
+
+    # Pose stays down past the refractory, then a third swipe fires.
+    t = trigger_ts + cfg.swipe_refractory_ms + 2 * STEP_MS
+    intents += feed(det, [(make_frame(t, 320, 240), False)])
+    intents += feed(det, swipe_steps("left", t0=t + STEP_MS))
+    assert [i.name for i in intents] == ["space_next", "space_next"]
+
+
+def test_swipe_requires_pose_drop_before_retrigger():
+    det = default_detector()
+    cfg = det.cfg
+    intents = feed(det, swipe_steps("left"))
+    assert len(intents) == 1
+    trigger_ts = intents[0].ts_ms
+
+    # Keep the open palm held (never dropping the pose) well past the
+    # refractory, then swipe again: must NOT re-trigger.
+    t = trigger_ts + STEP_MS
+    while t < trigger_ts + cfg.swipe_refractory_ms + 200.0:
+        intents += feed(det, [(make_frame(t, 89, 240), True)])
+        t += STEP_MS
+    intents += feed(det, swipe_steps("right", t0=t, x0=89.0))
+    assert len(intents) == 1
+
+
+def test_slow_palm_drift_does_not_trigger():
+    det = default_detector()
+    # ~150 px/s open-palm drift for 1.3s: displacement inside any swipe
+    # window stays far below the threshold.
+    steps = [(make_frame(i * STEP_MS, 400.0 - 5.0 * i, 240.0), True)
+             for i in range(40)]
+    assert feed(det, steps) == []
+
+
+def test_wave_reversal_does_not_trigger_swipe():
+    det = default_detector()
+    # Fast wave: 99px left, back, left, back — each leg is quick but the net
+    # displacement inside the swipe window never reaches the threshold.
+    xs = [320, 320, 287, 254, 221, 254, 287, 320, 287, 254, 221, 254, 287,
+          320, 320, 320]
+    steps = [(make_frame(i * STEP_MS, float(x), 240.0), True)
+             for i, x in enumerate(xs)]
+    assert feed(det, steps) == []
+
+
+def test_five_finger_pinch_in_fires_launchpad_once():
+    det = default_detector()
+    # Open palm collapses to a fist; open_palm drops as fingers curl, but the
+    # gesture must still fire (pinch-in does not require the pose flag).
+    ms = [1.0, 1.0, 1.0, 0.9, 0.75, 0.62, 0.5, 0.4, 0.4, 0.4, 0.4]
+    flags = [True, True, True, True, False, False, False, False, False,
+             False, False]
+    steps = [(make_frame(i * STEP_MS, 320, 240, m=m), f)
+             for i, (m, f) in enumerate(zip(ms, flags))]
+    intents = feed(det, steps)
+    assert [i.name for i in intents] == ["launchpad"]
+    assert intents[0].phase is Phase.TRIGGER
+    # Holding the fist past the refractory still cannot re-fire (no open
+    # sample left inside the spread window).
+    t0 = len(ms) * STEP_MS
+    more = [(make_frame(t0 + i * STEP_MS, 320, 240, m=0.4), False)
+            for i in range(30)]
+    assert feed(det, more) == []
+
+
+def test_five_finger_spread_out_fires_show_desktop_once():
+    det = default_detector()
+    # Curled hand (pose never formed) spreading wide open.
+    ms = [0.4, 0.4, 0.4, 0.5, 0.7, 0.9, 1.05, 1.15, 1.15]
+    flags = [False, False, False, False, False, False, True, True, True]
+    steps = [(make_frame(i * STEP_MS, 320, 240, m=m), f)
+             for i, (m, f) in enumerate(zip(ms, flags))]
+    intents = feed(det, steps)
+    assert [i.name for i in intents] == ["show_desktop"]
+    assert intents[0].phase is Phase.TRIGGER
+
+
+def test_custom_bindings_respected():
+    bindings = {"swipe_left": "custom_left", "swipe_right": "custom_right",
+                "swipe_up": "custom_up", "swipe_down": "custom_down",
+                "pinch_in": "custom_pinch", "spread_out": "custom_spread"}
+    det = PalmDetector(PalmConfig(), bindings)
+    intents = feed(det, swipe_steps("left"))
+    assert [i.name for i in intents] == ["custom_left"]
+
+    det2 = PalmDetector(PalmConfig(), bindings)
+    ms = [1.0, 1.0, 0.8, 0.6, 0.45, 0.4]
+    steps = [(make_frame(i * STEP_MS, 320, 240, m=m), m > 0.9)
+             for i, m in enumerate(ms)]
+    assert [i.name for i in feed(det2, steps)] == ["custom_pinch"]
+
+
+def test_hand_loss_clears_windows():
+    det = default_detector()
+    # Open palm, then the hand disappears; when it reappears already curled
+    # (inside what would have been the spread window) pinch-in must NOT fire
+    # because the pre-loss open samples were cleared.
+    steps = [(make_frame(i * STEP_MS, 320, 240, m=1.0), True) for i in range(3)]
+    steps.append((make_frame(3 * STEP_MS, 0, 0, hand=False), False))
+    steps += [(make_frame((4 + i) * STEP_MS, 320, 240, m=0.4), False)
+              for i in range(3)]
+    assert feed(det, steps) == []
+    assert det.active is False
+
+
+def test_active_flag_tracks_open_palm():
+    det = default_detector()
+    det.update(make_frame(0.0, 320, 240), open_palm=True)
+    assert det.active is True
+    det.update(make_frame(STEP_MS, 320, 240), open_palm=False)
+    assert det.active is False
+    det.reset()
+    assert det.active is False

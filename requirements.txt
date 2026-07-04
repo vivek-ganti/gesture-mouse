@@ -1,0 +1,8 @@
+mediapipe~=0.10
+opencv-contrib-python~=4.10
+pyobjc-framework-Quartz
+pyobjc-framework-Cocoa
+pyobjc-framework-ApplicationServices
+pyobjc-framework-AVFoundation
+numpy
+pytest

@@ -1,0 +1,99 @@
+{
+  "camera": {
+    "name": "FaceTime HD Camera",
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "mirror": true,
+    "rotate": 0,
+    "orientation": "front"
+  },
+  "hand": "auto",
+  "control_box": {
+    "x": 0.2,
+    "y": 0.45,
+    "w": 0.6,
+    "h": 0.35
+  },
+  "one_euro": {
+    "mincutoff": 1.0,
+    "beta": 0.007,
+    "dcutoff": 1.0,
+    "drag_mincutoff": 0.5,
+    "pinch_mincutoff": 3.0
+  },
+  "pinch": {
+    "left_engage": 0.35,
+    "left_release": 0.48,
+    "drag_release": 0.6,
+    "right_engage": 0.38,
+    "right_release": 0.52,
+    "engage_ms": 100.0,
+    "release_ms": 66.0,
+    "latch_lookback_ms": 100.0,
+    "latch_max_speed_px_s": 50.0,
+    "scale_stability_pct_per_100ms": 15.0,
+    "arbitration_ratio": 1.3
+  },
+  "click": {
+    "double_ms": 500.0,
+    "double_max_px": 15.0,
+    "double_reengage": 0.42,
+    "double_release": 0.44,
+    "drag_unfreeze_px": 12.0,
+    "drag_axis_deadband_pct": 20.0,
+    "right_tap_max_ms": 400.0
+  },
+  "scroll": {
+    "gain": 350.0,
+    "deadzone_frac": 0.03,
+    "max_px_s": 900.0,
+    "invert": false,
+    "enter_ms": 100.0,
+    "exit_ms": 130.0,
+    "together_max": 0.45,
+    "entry_max_speed_px_s": 60.0
+  },
+  "clutch": {
+    "engage_ms": 150.0,
+    "reacquire_ms": 250.0
+  },
+  "palm": {
+    "enter_ms": 80.0,
+    "swipe_min_vel_fw_s": 1.0,
+    "swipe_min_disp_frac": 0.22,
+    "swipe_window_ms": 350.0,
+    "swipe_refractory_ms": 600.0,
+    "spread_open": 0.9,
+    "spread_closed": 0.55,
+    "spread_in_start": 0.6,
+    "spread_out": 1.0,
+    "spread_window_ms": 500.0,
+    "spread_refractory_ms": 800.0
+  },
+  "suspend": {
+    "mouse_divergence_px": 8.0,
+    "keyboard_mute_ms": 1500.0
+  },
+  "hands_lost_ms": 265.0,
+  "hotkeys": {
+    "toggle": "ctrl+alt+g",
+    "panic": "ctrl+alt+escape"
+  },
+  "options": {
+    "dwell_right_click": false,
+    "privacy_preview": true,
+    "inertial_scroll": false,
+    "extended_test": "radial",
+    "audio_ticks": true,
+    "click_ticks": false
+  },
+  "bindings": {
+    "swipe_left": "space_next",
+    "swipe_right": "space_prev",
+    "swipe_up": "mission_control",
+    "swipe_down": "app_expose",
+    "pinch_in": "launchpad",
+    "spread_out": "show_desktop"
+  }
+}
