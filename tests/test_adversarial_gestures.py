@@ -131,6 +131,76 @@ def test_scroll_carry_accumulates_fractional_deltas():
     assert dy == 0 and abs(carry + 0.6) < 1e-9
 
 
+def test_swipe_fires_from_clutch_wait_without_cursor_engage():
+    """Raising an open hand and flicking must work WITHOUT ever clutching in
+    with the pointer pose — and it must not grant cursor control either:
+    the engine stays in CLUTCH_WAIT throughout."""
+    cfg = Config()
+    palm = PalmDetector(cfg.palm, dict(cfg.bindings))
+    s = Seq(pose="open")
+    s.hold("open", 400)                     # at rest: arms (never clutched)
+    s.move_to((320.0 - 280.0, 240.0), 200)  # flick left
+    intents, _, eng = run(s.frames, cfg=cfg, palm=palm)
+
+    assert [i.name for i in named(intents, "space_next")] == ["space_next"]
+    assert eng.state is EngineState.CLUTCH_WAIT
+    assert named(intents, "move") == []     # no cursor control was granted
+
+
+def test_swipe_survives_hand_loss_mid_flick_through_engine():
+    """End-to-end through the real engine: arm in PALM, flick, lose the hand
+    for ~130ms (engine drops to HANDS_LOST), reappear displaced — the swipe
+    still fires (forwarded from HANDS_LOST) and no cursor moves leaked."""
+    cfg = Config()
+    palm = PalmDetector(cfg.palm, dict(cfg.bindings))
+    s = Seq()
+    s.hold("pointer", 400)
+    t_arm = s.ts
+    s.hold("open", 250)                     # arm; engine enters PALM (frozen)
+    s.move_to((420.0, 240.0), 66)           # flick starts (+100px)
+    s.lose_hand(ms=130)                     # blur: hand gone ~4 frames
+    s.x = 600.0                             # reappears far right (+280 net)
+    s.hold("open", ms=STEP_MS)
+    intents, _, _ = run(s.frames, cfg=cfg, palm=palm)
+
+    assert [i.name for i in named(intents, "space_prev")] == ["space_prev"]
+    # Cursor frozen from PALM entry onward: no move intents after arming began.
+    assert all(i.ts_ms <= t_arm + cfg.palm.enter_ms + 2 * STEP_MS
+               for i in named(intents, "move"))
+
+
+def test_anchor_jump_in_palm_does_not_bounce_to_hands_lost():
+    """A real flick at 15-20fps legitimately moves the anchor >25% of the
+    frame in ONE frame. In PALM the teleport guard must not fire (cursor is
+    frozen; the hand-swap risk it covers is moot) — the swipe completes."""
+    cfg = Config()
+    palm = PalmDetector(cfg.palm, dict(cfg.bindings))
+    s = Seq()
+    s.hold("pointer", 400)
+    s.hold("open", 250)                     # arm in PALM
+    s.move_to((320.0 - 200.0, 240.0), STEP_MS)   # 200px in ONE frame (>25%)
+    s.hold(ms=3 * STEP_MS)
+    intents, _, eng = run(s.frames, cfg=cfg, palm=palm)
+
+    assert [i.name for i in named(intents, "space_next")] == ["space_next"]
+    assert eng.state is EngineState.PALM    # never bounced to HANDS_LOST
+
+
+def test_pinch_confirm_disarms_palm_detector():
+    from test_engine import _StubPalm
+
+    cfg = Config()
+    stub = _StubPalm(name="space_next")
+    stub.armed = True
+    stub.engaged = False                    # stay out of PALM state for pinch
+    s = Seq()
+    s.hold("pointer", 400)
+    s.pinch_to(0.20, 100)
+    s.hold(ms=200)
+    _, _, _ = run(s.frames, cfg=cfg, palm=stub)
+    assert stub.disarm_calls >= 1
+
+
 def test_scroll_pose_horizontal_flick_switches_tab_once_with_refractory():
     """Scroll pose (index+middle) + horizontal joystick = tab switch. One
     trigger per deflection with a 500ms refractory; the origin re-latches so
@@ -235,16 +305,18 @@ def test_palm_exit_survives_single_frame_pose_jitter_mid_gesture():
 def test_swipe_survives_a_jittered_frame_mid_motion():
     """A real fast swipe is exactly when hand-tracking is least stable
     (motion blur); one dropped-pose frame in the middle of the flick must
-    not silently swallow the swipe."""
+    not silently swallow the swipe. Arm-at-rest model: open palm held still
+    ~250ms (arming), then the flick — pose state during the motion is
+    irrelevant by design."""
     cfg = Config()
     palm = PalmDetector(cfg.palm, dict(cfg.bindings))
     s = Seq()
     s.hold("pointer", 400)
-    s.hold("open", 150)                    # enter PALM comfortably
-    s.move_to((420.0, 240.0), 33)           # start of the flick (open pose)
+    s.hold("open", 250)                    # arm: open palm at rest
+    s.move_to((420.0, 240.0), 33)           # flick starts (open pose)
     s.hold("relaxed", ms=STEP_MS)           # ONE jittered frame mid-flick
     s.pose = "open"
-    s.move_to((520.0, 240.0), 100)          # flick continues (25%+ of frame width)
+    s.move_to((520.0, 240.0), 100)          # flick continues (>=0.25 frame width)
     intents, _, _ = run(s.frames, cfg=cfg, palm=palm)
     # Rightward anchor motion -> swipe_right -> DEFAULT_BINDINGS "space_prev".
     assert named(intents, "space_prev")

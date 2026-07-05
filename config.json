@@ -52,7 +52,9 @@
     "enter_ms": 100.0,
     "exit_ms": 130.0,
     "together_max": 0.45,
-    "entry_max_speed_px_s": 60.0
+    "entry_max_speed_px_s": 60.0,
+    "tab_deadzone_frac": 0.08,
+    "tab_refractory_ms": 500.0
   },
   "clutch": {
     "engage_ms": 150.0,
@@ -60,22 +62,32 @@
   },
   "palm": {
     "enter_ms": 80.0,
-    "swipe_min_vel_fw_s": 1.0,
-    "swipe_min_disp_frac": 0.22,
-    "swipe_window_ms": 350.0,
-    "swipe_refractory_ms": 600.0,
+    "arm_hold_ms": 150.0,
+    "arm_max_speed_fw_s": 0.3,
+    "swipe_min_disp_frac": 0.25,
+    "swipe_max_duration_ms": 800.0,
+    "swipe_axis_dominance": 1.5,
+    "swipe_cooldown_ms": 1000.0,
+    "swipe_gap_bridge_ms": 350.0,
     "spread_open": 0.9,
     "spread_closed": 0.55,
     "spread_in_start": 0.6,
     "spread_out": 1.0,
     "spread_window_ms": 500.0,
-    "spread_refractory_ms": 800.0
+    "spread_refractory_ms": 800.0,
+    "forward_max_speed_px_s": 300.0
+  },
+  "tracking": {
+    "min_detection_confidence": 0.5,
+    "min_presence_confidence": 0.4,
+    "min_tracking_confidence": 0.3
   },
   "suspend": {
     "mouse_divergence_px": 8.0,
     "keyboard_mute_ms": 1500.0
   },
   "hands_lost_ms": 265.0,
+  "pose_jitter_grace_ms": 120.0,
   "hotkeys": {
     "toggle": "ctrl+alt+g",
     "panic": "ctrl+alt+escape"
@@ -86,7 +98,8 @@
     "inertial_scroll": false,
     "extended_test": "radial",
     "audio_ticks": true,
-    "click_ticks": false
+    "click_ticks": false,
+    "debug_gestures": false
   },
   "bindings": {
     "swipe_left": "space_next",

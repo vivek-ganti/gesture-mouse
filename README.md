@@ -99,6 +99,7 @@ prefer it or the venv is already active in your shell.)
 | `--replay-post` | with `--replay`: actually post the replayed intents |
 | `--no-preview` | disable the cv2 tuning window |
 | `--no-privacy` | show the camera image in the preview (default: skeleton on black) |
+| `--debug-gestures` | print swipe arming/candidate/rejection events live |
 
 Hotkeys (global, configurable in `config.json`): **⌃⌥G** toggle IDLE⇄ACTIVE ·
 **⌃⌥Esc** panic → IDLE, releasing all buttons.
@@ -139,22 +140,33 @@ re-scans for new devices every few seconds.
 | Right click | Thumb–**middle** pinch, index kept extended | Tap-only |
 | Scroll | Index+middle extended and together, ring+pinky folded → vertical joystick | Entry needs the pose 100 ms *and* a slow cursor; cursor frozen while scrolling |
 | Tab switch | Same two-finger scroll pose → flick **horizontally** | Right = next tab (Ctrl+Tab), left = previous (Ctrl+Shift+Tab); one per flick, 500 ms refractory |
-| Space left/right | **Four**-finger open palm (thumb ignored), swipe left/right | Open palm = system-gesture mode, cursor frozen |
-| Mission Control | Four-finger open palm, swipe up | |
-| App Exposé | Four-finger open palm, swipe down | |
-| Launchpad | Five-finger pinch-in (open palm → fist) | Uses the continuous spread meter (bottom-left "P" bar), not the four-finger pose |
+| Space left/right | Open hand, **hold still a beat, then flick** left/right | The brief still moment "arms" the swipe (ARMED tag in the preview); works even without clutching in first |
+| Mission Control | Open hand, hold still a beat, flick up | |
+| App Exposé | Open hand, hold still a beat, flick down | |
+| Launchpad | Five-finger pinch-in (open palm → fist) | Uses the continuous spread meter (bottom-left "P" bar), not the arming pose |
 | Show Desktop | Five-finger spread-out (fist → open palm) | Same meter, opposite direction |
 | Suspend / resume | Grab the real mouse or type / pointer pose 250 ms or ⌃⌥G | See safety model |
 | Panic | ⌃⌥Esc | Buttons released, camera off |
 
-The "open palm" pose that arms the four swipes deliberately **ignores the
-thumb** — the thumb's extension is much less reliable to detect than the
-other four fingers (it moves sideways across the palm, not radially from the
-wrist), and matching how a real trackpad's 4-finger swipe already works costs
-nothing. Launchpad/Show Desktop don't use this pose at all; they read a
-continuous five-finger spread value instead, shown live as the "P" meter in
-the preview window (bottom-left, above the L/R pinch meters) — watch it swing
-as you open/close your hand to see exactly where the thresholds sit.
+### How swipes work (and how to debug them)
+
+Swipes use an **arm-at-rest** model, the recipe every shipped MediaPipe
+gesture project converges on: hold your open hand still for ~150 ms (the
+"ARMED" tag appears in the preview and the "S" bar starts tracking), then
+flick in one direction — the hand must travel about a quarter of the camera
+frame. During the flick itself nothing else matters: not finger poses (motion
+blur destroys them — the pose only gates the *arming*, tested while your
+hand is still), and not even continuous tracking (MediaPipe routinely loses
+a fast-moving hand for a few frames; the detector bridges gaps up to 350 ms).
+After each swipe there's a ~1 s cooldown, then arm again for the next one.
+The open-palm arming pose ignores the thumb (its extension is unreliable to
+detect); Launchpad/Show Desktop read the continuous five-finger spread value
+("P" meter) instead and need no arming.
+
+If a swipe won't fire, run with `--debug-gestures`: every arming start/abort
+(with the reason), every candidate evaluation, and every rejection prints to
+the terminal — and `tools/analyze_recording.py` prints the same forensics
+plus dropout histograms for a recorded clip.
 
 Bindings for the six system gestures are remappable in `config.json`
 (`bindings`: swipe_left/right/up/down, pinch_in, spread_out → any of

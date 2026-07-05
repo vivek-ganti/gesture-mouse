@@ -229,14 +229,18 @@ class GestureEngine:
         return out
 
     @property
-    def palm_debug(self) -> dict[str, float | bool]:
+    def palm_debug(self) -> dict[str, float | bool | str]:
         """Live palm-gesture tuning readout (additive to the CONTRACTS.md
-        surface): whether the four-finger pose is currently held, and the
-        continuous five-finger spread metric (Launchpad/Show Desktop) against
-        which ``palm.spread_closed`` / ``palm.spread_open`` are compared."""
-        out: dict[str, float | bool] = {"open": self._last_open_palm}
-        if self._palm is not None and self._palm.last_m is not None:
-            out["m"] = self._palm.last_m
+        surface): whether the four-finger pose is currently held, plus the
+        detector's own snapshot (swipe phase, armed flag, net displacement
+        progress, spread metric) when one is wired in."""
+        out: dict[str, float | bool | str] = {"open": self._last_open_palm}
+        if self._palm is not None:
+            detector_debug = getattr(self._palm, "debug", None)
+            if isinstance(detector_debug, dict):
+                out.update(detector_debug)
+            elif getattr(self._palm, "last_m", None) is not None:
+                out["m"] = self._palm.last_m
         return out
 
     # -- pose tests ---------------------------------------------------------
@@ -365,6 +369,14 @@ class GestureEngine:
         self._right_since = None
         self._arb = None
 
+    def _disarm_palm(self) -> None:
+        """A pinch/scroll starting means the open hand was incidental — a
+        stale armed swipe must not fire the moment that gesture releases."""
+        if self._palm is not None:
+            disarm = getattr(self._palm, "disarm", None)
+            if disarm is not None:
+                disarm()
+
     def _enter_hands_lost(self, ts: float) -> None:
         self.state = EngineState.HANDS_LOST
         self._lost_since = ts
@@ -434,12 +446,16 @@ class GestureEngine:
 
         stable = self._scale_stable(ts) if valid else True
 
-        # Hand loss / anchor teleport from any active state.
+        # Hand loss / anchor teleport from any active state. The teleport
+        # guard is SKIPPED in PALM: a real swipe flick at 15-20fps
+        # legitimately moves the anchor >25% of the frame in one frame, and
+        # the cursor is frozen there so the hand-swap risk it covers is moot.
         if self.state in _ACTIVE_STATES:
             if not valid:
                 self._enter_hands_lost(ts)
             elif (
-                self._prev_anchor is not None
+                self.state is not EngineState.PALM
+                and self._prev_anchor is not None
                 and anchor is not None
                 and dist(anchor, self._prev_anchor) > _ANCHOR_JUMP_FRAC * frame.img_w
             ):
@@ -465,42 +481,49 @@ class GestureEngine:
         elif st is EngineState.HANDS_LOST:
             rebase = self._tick_hands_lost(frame, cursor, ts, valid, intents)
 
-        # Forward PALM-detector intents: everything while in PALM; also from
-        # a POINTER hand, because a real open-palm-then-swipe motion is one
-        # fluid gesture that often completes BEFORE the engine has spent
-        # palm.enter_ms formally transitioning its own state to PALM (that
-        # hold is about pose, not motion, so a fast continuous swipe finishes
-        # first) -- gating swipes on "already in PALM" silently dropped
-        # exactly the natural case, not just an edge case.
+        # Forward PALM-detector intents.
         #
-        # Swipes and pinch/spread need different POINTER-side gates:
-        # - Swipes already require open_palm + their own displacement/
-        #   velocity/direction thresholds inside palm.py, and a genuine swipe
-        #   IS fast anchor motion by definition -- also requiring a slow
-        #   CURSOR (palm.forward_max_speed_px_s) would fight the very motion
-        #   being detected, since cursor speed tracks anchor speed. No extra
-        #   gate here.
-        # - pinch_in/spread_out don't require fast motion, so the speed gate
-        #   still does its original job there: don't fire Launchpad/Show
-        #   Desktop just because the cursor is moving normally.
+        # Swipe-bound intents forward from CLUTCH_WAIT, POINTER, PALM and
+        # HANDS_LOST: arming (open palm held AT REST inside palm.py) is the
+        # deliberate-intent signal, so no cursor clutch is prerequisite —
+        # raising an open hand and flicking must work without ever having
+        # clutched in (CLUTCH_WAIT), and the engine may be parked in
+        # HANDS_LOST precisely because the swipe motion blurred the hand
+        # away for a few frames (the detector can only ever emit on a
+        # hand-PRESENT frame, so "no swipes while the hand is actually gone"
+        # is enforced by physics). Never from PINCHED/RIGHT_PINCH/SCROLL —
+        # those states disarm the detector on entry.
+        #
+        # pinch_in/spread_out keep their original gates: PALM always;
+        # POINTER only with a slow cursor (palm.forward_max_speed_px_s) so
+        # normal cursor motion can't fire Launchpad/Show Desktop.
+        #
+        # Any other intent name (custom detector stubs) stays PALM-only.
         if palm_intents:
-            if self.state is EngineState.PALM:
-                intents.extend(palm_intents)
-            elif self.state is EngineState.POINTER:
-                swipe_names = {
-                    self.cfg.bindings.get(k) for k in
-                    ("swipe_left", "swipe_right", "swipe_up", "swipe_down")
-                } - {None}
-                pinch_spread_names = {
-                    self.cfg.bindings.get("pinch_in"),
-                    self.cfg.bindings.get("spread_out"),
-                } - {None}
-                slow_enough = cursor.speed_px_s < self.cfg.palm.forward_max_speed_px_s
-                for i in palm_intents:
-                    if i.name in swipe_names or (
-                        i.name in pinch_spread_names and slow_enough
-                    ):
-                        intents.append(i)
+            swipe_names = {
+                self.cfg.bindings.get(k) for k in
+                ("swipe_left", "swipe_right", "swipe_up", "swipe_down")
+            } - {None}
+            pinch_spread_names = {
+                self.cfg.bindings.get("pinch_in"),
+                self.cfg.bindings.get("spread_out"),
+            } - {None}
+            slow_enough = cursor.speed_px_s < self.cfg.palm.forward_max_speed_px_s
+            for i in palm_intents:
+                if self.state is EngineState.PALM:
+                    intents.append(i)
+                elif i.name in swipe_names and self.state in (
+                    EngineState.CLUTCH_WAIT,
+                    EngineState.POINTER,
+                    EngineState.HANDS_LOST,
+                ):
+                    intents.append(i)
+                elif (
+                    i.name in pinch_spread_names
+                    and self.state is EngineState.POINTER
+                    and slow_enough
+                ):
+                    intents.append(i)
 
         freeze = self.state in (
             EngineState.CLUTCH_WAIT,
@@ -541,14 +564,18 @@ class GestureEngine:
             or self._arb is not None
         )
 
-        # PALM entry (only with a detector wired in, and no pinch in flight).
-        # open_palm_since is the debounced hold's start ts (already jitter-
-        # tolerant), so entry is a plain duration check against it.
-        if (
-            self._palm is not None
-            and not pinch_active
-            and open_palm_since is not None
-            and ts - open_palm_since >= self.cfg.palm.enter_ms
+        # PALM entry (only with a detector wired in, and no pinch in flight):
+        # either the debounced open-pose hold (freezes the cursor within
+        # ~enter_ms of raising an open hand, before/while the detector arms)
+        # OR the detector reporting itself mid-episode (arming/armed/cooldown
+        # — the safety net when the pose path missed, so an armed swipe never
+        # drags the live cursor across the screen).
+        if self._palm is not None and not pinch_active and (
+            (
+                open_palm_since is not None
+                and ts - open_palm_since >= self.cfg.palm.enter_ms
+            )
+            or getattr(self._palm, "engaged", False)
         ):
             self.state = EngineState.PALM
             self._clear_pinch()
@@ -570,6 +597,7 @@ class GestureEngine:
             self._scroll_y0 = lm[INDEX_MCP].y
             self._scroll_x0 = lm[INDEX_MCP].x
             self._clear_pinch()
+            self._disarm_palm()
             return None
 
         down = self._tick_pinch_candidates(lm, cursor, ts, stable)
@@ -679,6 +707,7 @@ class GestureEngine:
         self._release_latch = None
         self._clear_pinch()
         self._scroll_hold.reset()
+        self._disarm_palm()
         if cc == 2:
             self._last_up = None  # a double consumes the window (no triples)
         return Intent(
@@ -699,6 +728,7 @@ class GestureEngine:
         self._release_latch = None
         self._clear_pinch()
         self._scroll_hold.reset()
+        self._disarm_palm()
         return None
 
     # -- PINCHED (left held: click pending or dragging) -----------------------
@@ -870,10 +900,14 @@ class GestureEngine:
     def _tick_palm(
         self, cursor: CursorSample, open_palm_debounced: bool
     ) -> tuple[float, float] | None:
-        # open_palm_debounced already absorbed the jitter grace (it only goes
-        # false after grace_ms of sustained non-open frames), so a single
-        # dropped-finger frame mid-gesture can't cut PALM short.
-        if open_palm_debounced:
+        # Stay frozen while the pose holds (debounced) OR the detector is
+        # mid-episode (arming -> swipe motion -> cooldown): the freeze must
+        # survive the swipe itself (pose lost to blur is expected) and the
+        # return motion during cooldown, or the flick flings the cursor.
+        # Rebase on exit guarantees no jump when control resumes.
+        if open_palm_debounced or (
+            self._palm is not None and getattr(self._palm, "engaged", False)
+        ):
             return None
         self._to_pointer()
         return (cursor.x, cursor.y)

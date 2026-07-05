@@ -155,11 +155,13 @@ def _draw_pinch_meters(
 
 
 def _draw_palm_meter(
-    canvas: np.ndarray, palm_debug: dict[str, float | bool], cfg: Config
+    canvas: np.ndarray, palm_debug: dict[str, float | bool | str], cfg: Config
 ) -> None:
-    """Five-finger spread metric (Launchpad = falls below spread_closed;
-    Show Desktop = rises above spread_out) plus the four-finger open-palm
-    pose flag that arms swipes. Sits directly above the pinch meters."""
+    """Two rows above the pinch meters: the five-finger spread metric
+    (Launchpad = falls below spread_closed; Show Desktop = rises above
+    spread_out), and the swipe detector's state — ARMING/ARMED/COOLDOWN tag
+    plus a displacement-progress bar that fills toward the fire threshold
+    while a swipe is in flight."""
     h = canvas.shape[0]
     bar_w, bar_h, gap = 160, 10, 8
     y = h - gap - bar_h - 2 * (bar_h + gap)   # one row above the 2 pinch meters
@@ -170,9 +172,25 @@ def _draw_palm_meter(
         cfg.palm.spread_closed, cfg.palm.spread_open, full_scale=1.4,
     )
     open_now = bool(palm_debug.get("open"))
-    tag, color = ("4-FINGER OPEN", _GREEN) if open_now else ("", _WHITE)
-    if tag:
-        _put_text(canvas, tag, (gap + bar_w + 90, y + bar_h - 1), color, 0.4)
+    if open_now:
+        _put_text(canvas, "4-FINGER OPEN", (gap + bar_w + 90, y + bar_h - 1),
+                  _GREEN, 0.4)
+
+    # Swipe row: displacement progress toward swipe_min_disp_frac + phase tag.
+    y_sw = y - bar_h - gap
+    disp = palm_debug.get("disp_frac")
+    disp_val = disp if isinstance(disp, float) else None
+    _draw_meter(
+        canvas, gap, y_sw, bar_w, bar_h, "S", disp_val,
+        cfg.palm.swipe_min_disp_frac, cfg.palm.swipe_min_disp_frac,
+        full_scale=max(0.5, cfg.palm.swipe_min_disp_frac * 2.0), invert=True,
+    )
+    phase = palm_debug.get("phase")
+    if isinstance(phase, str) and phase != "idle":
+        tag = phase.upper()
+        color = _GREEN if phase == "armed" else (
+            _GRAY if phase == "cooldown" else _WHITE)
+        _put_text(canvas, tag, (gap + bar_w + 90, y_sw + bar_h - 1), color, 0.4)
 
 
 def _draw_banner(canvas: np.ndarray, text: str, y: int, bg: tuple[int, int, int]) -> int:

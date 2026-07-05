@@ -357,12 +357,20 @@ class _StubPalm:
         self.name = name
         self.active = False
         self.calls = 0
+        self.armed = False
+        self.engaged = False
+        self.disarm_calls = 0
 
     def update(self, frame, open_palm):
         from gesture_mouse.types import Intent
         self.calls += 1
         self.active = open_palm
         return [Intent(self.name, Phase.TRIGGER, {}, frame.ts_ms)]
+
+    def disarm(self):
+        self.disarm_calls += 1
+        self.armed = False
+        self.engaged = False
 
     def reset(self):
         self.active = False

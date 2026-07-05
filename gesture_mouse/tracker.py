@@ -377,10 +377,22 @@ class CameraTracker:
         from mediapipe.tasks import python as mp_tasks
         from mediapipe.tasks.python import vision
 
+        # Presence/tracking confidences are configured BELOW MediaPipe's 0.5
+        # defaults on purpose: fast lateral motion blurs the hand and at the
+        # defaults it is declared absent for several frames in the middle of
+        # every fast swipe (the landmark model wasn't trained on blur; the
+        # hand outruns the VIDEO-mode tracking ROI). Lower thresholds keep
+        # the blurred-but-findable hand "present" — gross palm position
+        # survives blur long after fingertip precision dies, which is what
+        # swipe detection tracks. See config.TrackingConfig.
+        tr = self._cfg.tracking
         options = vision.HandLandmarkerOptions(
             base_options=mp_tasks.BaseOptions(model_asset_path=self._model_path),
             running_mode=vision.RunningMode.VIDEO,
             num_hands=1,
+            min_hand_detection_confidence=tr.min_detection_confidence,
+            min_hand_presence_confidence=tr.min_presence_confidence,
+            min_tracking_confidence=tr.min_tracking_confidence,
         )
         return vision.HandLandmarker.create_from_options(options)
 

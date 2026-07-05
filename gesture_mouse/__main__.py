@@ -132,6 +132,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
                     help="show the camera image in the preview (default: skeleton on black)")
     ap.add_argument("--start-active", action="store_true",
                     help="open the camera immediately instead of waiting for the toggle hotkey")
+    ap.add_argument("--debug-gestures", action="store_true",
+                    help="print swipe arming/candidate/rejection events live")
     ap.add_argument("--replay-post", action="store_true",
                     help="POST replayed intents as real input (default: print only)")
     return ap.parse_args(argv)
@@ -152,7 +154,8 @@ class App:
         except Exception:  # headless replay (no window server)
             sw, sh = 1440.0, 900.0
         self.pipeline = CursorPipeline(self.cfg, sw, sh)
-        self.palm = PalmDetector(self.cfg.palm, self.cfg.bindings)
+        self.palm = PalmDetector(self.cfg.palm, self.cfg.bindings,
+                                 debug=self.cfg.options.debug_gestures)
         self.engine = GestureEngine(self.cfg, self.pipeline.pinch, self.palm)
         self.synth: Synth | None = Synth() if self.post_events else None
         # Guards exist whenever we post real input — including --replay-post,
@@ -232,6 +235,10 @@ class App:
             self.pipeline.rebase(*out.rebase)
         self.perf.add("filter", (t1 - t0) * 1e3)
         self.perf.add("engine", (t2 - t1) * 1e3)
+        if self.cfg.options.debug_gestures:
+            while self.palm.events:
+                ts, msg = self.palm.events.popleft()
+                print(f"[swipe {ts:8.0f}ms] {msg}")
         return out
 
     def _tee(self, frame: LandmarkFrame) -> None:
@@ -691,6 +698,8 @@ def main(argv: list[str] | None = None) -> int:
         cfg.camera.name = args.camera
     if args.no_privacy:
         cfg.options.privacy_preview = False
+    if args.debug_gestures:
+        cfg.options.debug_gestures = True
 
     if args.replay is None:  # preflight skipped for --replay/--list-cameras
         if not permissions.preflight(require=True):

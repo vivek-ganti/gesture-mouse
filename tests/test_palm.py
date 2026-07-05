@@ -51,19 +51,35 @@ def feed(det: PalmDetector, steps):
     return intents
 
 
+# Enough rest frames to arm: the speed estimate needs a >=80ms trajectory
+# baseline before it reports "at rest" at all, then arm_hold_ms (150) of
+# open-palm-at-rest. 12 frames @30fps = ~400ms, comfortably past both.
+N_REST = 12
+# 6 motion frames x 45px = 270px net, past 0.25*640=160 (h) / 0.25*480=120 (v).
+N_MOVE = 6
+STEP_PX = 45.0
+
+
+def rest_steps(t0: float = 0.0, x0: float = 320.0, y0: float = 240.0,
+               n: int = N_REST, open_palm: bool = True):
+    """Stationary open-palm frames: the arming prefix."""
+    return [(make_frame(t0 + i * STEP_MS, x0, y0), open_palm)
+            for i in range(n)]
+
+
 def swipe_steps(direction: str, t0: float = 0.0, x0: float = 320.0,
-                y0: float = 240.0, n_hold: int = 3, n_move: int = 7,
-                step_px: float = 33.0):
-    """Open-palm hold then fast unidirectional move (~1000 px/s)."""
+                y0: float = 240.0, n_rest: int = N_REST, n_move: int = N_MOVE,
+                step_px: float = STEP_PX, motion_pose: bool = False):
+    """Arm-at-rest prefix, then a fast flick. The motion frames carry
+    open_palm=False by DEFAULT — pose loss during fast motion is the norm on
+    real data (motion blur), and the new model must not care."""
     ux, uy = {"left": (-1, 0), "right": (1, 0),
               "up": (0, -1), "down": (0, 1)}[direction]
-    steps = []
-    for i in range(n_hold):
-        steps.append((make_frame(t0 + i * STEP_MS, x0, y0), True))
+    steps = rest_steps(t0, x0, y0, n_rest)
     for i in range(1, n_move + 1):
-        ts = t0 + (n_hold - 1 + i) * STEP_MS
+        ts = t0 + (n_rest - 1 + i) * STEP_MS
         steps.append((make_frame(ts, x0 + ux * step_px * i,
-                                 y0 + uy * step_px * i), True))
+                                 y0 + uy * step_px * i), motion_pose))
     return steps
 
 
@@ -85,43 +101,51 @@ def test_swipe_each_direction_fires_bound_intent_once(direction, expected):
     assert intents[0].ts_ms > 0.0
 
 
-def test_swipe_refractory_blocks_immediate_repeat():
+def test_swipe_cooldown_blocks_immediate_repeat():
     det = default_detector()
     cfg = det.cfg
     intents = feed(det, swipe_steps("left"))
     assert len(intents) == 1
     trigger_ts = intents[0].ts_ms
 
-    # Drop the pose (re-arm), then swipe again while still refractory.
-    t = trigger_ts + 3 * STEP_MS
-    intents += feed(det, [(make_frame(t, 320, 240), False)])
-    second = swipe_steps("left", t0=t + STEP_MS)
-    assert second[-1][0].ts_ms < trigger_ts + cfg.swipe_refractory_ms
+    # A full arm+swipe attempt entirely inside the cooldown: blocked.
+    second = swipe_steps("left", t0=trigger_ts + STEP_MS)
+    assert second[-1][0].ts_ms < trigger_ts + cfg.swipe_cooldown_ms
     intents += feed(det, second)
-    assert len(intents) == 1  # blocked by refractory
+    assert len(intents) == 1  # blocked by cooldown
 
-    # Pose stays down past the refractory, then a third swipe fires.
-    t = trigger_ts + cfg.swipe_refractory_ms + 2 * STEP_MS
-    intents += feed(det, [(make_frame(t, 320, 240), False)])
-    intents += feed(det, swipe_steps("left", t0=t + STEP_MS))
+    # After the cooldown, a fresh arm+swipe fires again.
+    t = trigger_ts + cfg.swipe_cooldown_ms + 2 * STEP_MS
+    intents += feed(det, swipe_steps("left", t0=t))
     assert [i.name for i in intents] == ["space_next", "space_next"]
 
 
-def test_swipe_requires_pose_drop_before_retrigger():
+def test_swipe_requires_rearm_after_fire():
     det = default_detector()
     cfg = det.cfg
     intents = feed(det, swipe_steps("left"))
     assert len(intents) == 1
     trigger_ts = intents[0].ts_ms
+    last_x = 320.0 - N_MOVE * STEP_PX
 
-    # Keep the open palm held (never dropping the pose) well past the
-    # refractory, then swipe again: must NOT re-trigger.
+    # Keep MOVING (never resting) from the fire through well past the
+    # cooldown: without a fresh arm (open palm at rest) nothing may fire,
+    # no matter how much displacement accumulates.
     t = trigger_ts + STEP_MS
-    while t < trigger_ts + cfg.swipe_refractory_ms + 200.0:
-        intents += feed(det, [(make_frame(t, 89, 240), True)])
+    x = last_x
+    end = trigger_ts + cfg.swipe_cooldown_ms + 600.0
+    direction = 1.0
+    while t < end:
+        x += 40.0 * direction
+        if not 40.0 <= x <= 600.0:
+            direction = -direction
+        intents += feed(det, [(make_frame(t, x, 240.0), True)])
         t += STEP_MS
-    intents += feed(det, swipe_steps("right", t0=t, x0=89.0))
     assert len(intents) == 1
+
+    # Now rest with the palm open (re-arm) and flick: fires.
+    intents += feed(det, swipe_steps("right", t0=t + STEP_MS, x0=x))
+    assert [i.name for i in intents] == ["space_next", "space_prev"]
 
 
 def test_slow_palm_drift_does_not_trigger():
@@ -135,12 +159,104 @@ def test_slow_palm_drift_does_not_trigger():
 
 def test_wave_reversal_does_not_trigger_swipe():
     det = default_detector()
-    # Fast wave: 99px left, back, left, back — each leg is quick but the net
-    # displacement inside the swipe window never reaches the threshold.
-    xs = [320, 320, 287, 254, 221, 254, 287, 320, 287, 254, 221, 254, 287,
-          320, 320, 320]
-    steps = [(make_frame(i * STEP_MS, float(x), 240.0), True)
-             for i, x in enumerate(xs)]
+    # Arm properly, then wave: 99px left, back, left, back — fast legs, but
+    # the NET displacement from the arming origin never reaches the 0.25
+    # threshold (waving at someone on a call must not switch Spaces).
+    steps = rest_steps()
+    xs = [287, 254, 221, 254, 287, 320, 287, 254, 221, 254, 287, 320, 320]
+    t0 = N_REST * STEP_MS
+    steps += [(make_frame(t0 + i * STEP_MS, float(x), 240.0), True)
+              for i, x in enumerate(xs)]
+    assert feed(det, steps) == []
+
+
+def test_swipe_survives_hand_loss_within_bridge():
+    """THE headline regression: MediaPipe dropping the hand for a few frames
+    mid-swipe is documented-normal under fast motion. Arm, start the flick,
+    lose the hand for ~130ms (under the 350ms bridge), reappear displaced —
+    the swipe must still fire. The old detector cleared everything on a
+    single absent frame."""
+    det = default_detector()
+    steps = swipe_steps("left", n_move=2)          # 90px in, then...
+    t0 = steps[-1][0].ts_ms
+    for i in range(1, 5):                          # ...4 absent frames (~130ms)
+        steps.append((make_frame(t0 + i * STEP_MS, 0, 0, hand=False), False))
+    # Reappears well past the displacement threshold.
+    steps.append((make_frame(t0 + 5 * STEP_MS, 320.0 - 280.0, 240.0), False))
+    intents = feed(det, steps)
+    assert [i.name for i in intents] == ["space_next"]
+
+
+def test_gap_over_bridge_disarms():
+    det = default_detector()
+    steps = swipe_steps("left", n_move=2)
+    t0 = steps[-1][0].ts_ms
+    for i in range(1, 15):                         # ~460ms gap > 350ms bridge
+        steps.append((make_frame(t0 + i * STEP_MS, 0, 0, hand=False), False))
+    steps.append((make_frame(t0 + 15 * STEP_MS, 320.0 - 280.0, 240.0), False))
+    assert feed(det, steps) == []
+
+
+def test_pose_loss_during_motion_is_the_norm():
+    """Every motion frame carries open_palm=False (what blur does to finger
+    landmarks) — the swipe fires anyway; only ARMING needed the pose."""
+    det = default_detector()
+    intents = feed(det, swipe_steps("right", motion_pose=False))
+    assert [i.name for i in intents] == ["space_prev"]
+
+
+def test_arming_requires_rest():
+    """Open palm that is ALREADY moving fast never arms — big displacement
+    with no at-rest arming prefix must not fire."""
+    det = default_detector()
+    steps = [(make_frame(i * STEP_MS, 600.0 - 45.0 * i, 240.0), True)
+             for i in range(12)]                   # 495px of open-palm motion
+    assert feed(det, steps) == []
+
+
+def test_arming_requires_pose():
+    """A fist at rest then a flick: never armed (no open palm), no fire."""
+    det = default_detector()
+    steps = swipe_steps("left")
+    steps = [(frame, False) for frame, _ in steps]  # same motion, pose never on
+    assert feed(det, steps) == []
+
+
+def test_window_expiry_requires_rearm():
+    """Armed, move partway (below threshold), then stall past
+    swipe_max_duration_ms with the pose down: the episode expires, and a
+    fast flick AFTER the expiry must not fire without a fresh arm."""
+    det = default_detector()
+    cfg = det.cfg
+    steps = rest_steps()
+    t0 = N_REST * STEP_MS
+    # 3 fast frames x 33px = 99px: motion started, threshold not reached.
+    for i in range(1, 4):
+        steps.append((make_frame(t0 + i * STEP_MS, 320.0 - 33.0 * i, 240.0),
+                      False))
+    # Stall (fist, stationary) until the window is long expired.
+    x_stall = 320.0 - 99.0
+    t1 = t0 + 4 * STEP_MS
+    n_stall = int((cfg.swipe_max_duration_ms + 300.0) / STEP_MS)
+    for i in range(n_stall):
+        steps.append((make_frame(t1 + i * STEP_MS, x_stall, 240.0), False))
+    # Fast flick with no re-arm: dead.
+    t2 = t1 + n_stall * STEP_MS
+    for i in range(1, 7):
+        steps.append((make_frame(t2 + i * STEP_MS, x_stall - 45.0 * i, 240.0),
+                      False))
+    assert feed(det, steps) == []
+
+
+def test_diagonal_motion_does_not_fire():
+    det = default_detector()
+    steps = rest_steps()
+    t0 = N_REST * STEP_MS
+    # 45-degree-equivalent in FRACTION space: equal fx and fy per frame.
+    for i in range(1, 7):
+        steps.append((make_frame(t0 + i * STEP_MS,
+                                 320.0 - 0.06 * 640 * i,
+                                 240.0 - 0.06 * 480 * i), False))
     assert feed(det, steps) == []
 
 

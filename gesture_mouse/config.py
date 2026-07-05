@@ -94,13 +94,22 @@ class ClutchConfig:
 
 @dataclass
 class PalmConfig:
-    """PALM mode: open-hand system gestures (trackpad parity)."""
+    """PALM mode: open-hand system gestures (trackpad parity).
 
-    enter_ms: float = 80.0
-    swipe_min_vel_fw_s: float = 1.0      # frame-widths per second
-    swipe_min_disp_frac: float = 0.22    # of frame width (or height for vertical)
-    swipe_window_ms: float = 350.0
-    swipe_refractory_ms: float = 600.0
+    Swipe model (arm-at-rest -> net displacement; see palm.py): hold an open
+    palm STILL for arm_hold_ms to arm, then flick — the motion itself needs
+    no pose (motion blur destroys finger landmarks mid-swipe) and tolerates
+    the hand disappearing entirely for up to swipe_gap_bridge_ms (normal
+    MediaPipe behavior under fast motion)."""
+
+    enter_ms: float = 80.0               # debounced open pose -> PALM (cursor freeze)
+    arm_hold_ms: float = 150.0           # open palm at rest this long to arm
+    arm_max_speed_fw_s: float = 0.30     # palm-center speed ceiling for "at rest"
+    swipe_min_disp_frac: float = 0.25    # net travel, fraction of frame span
+    swipe_max_duration_ms: float = 800.0  # fire window after (last) arming origin
+    swipe_axis_dominance: float = 1.5    # major axis >= this x minor (fraction space)
+    swipe_cooldown_ms: float = 1000.0    # after a fire; full re-arm required
+    swipe_gap_bridge_ms: float = 350.0   # hand-absent gap tolerated while armed
     spread_open: float = 0.9             # m above this = open palm start
     spread_closed: float = 0.55          # pinch-in fires when m falls below
     spread_in_start: float = 0.6         # spread-out must start below this
@@ -115,6 +124,24 @@ class PalmConfig:
     # drifts a bit while flexing all five fingers, and this isn't a scroll-
     # style continuous gesture that needs a still start.
     forward_max_speed_px_s: float = 300.0
+
+
+@dataclass
+class TrackingConfig:
+    """MediaPipe Hand Landmarker confidence thresholds.
+
+    Presence/tracking are deliberately LOWER than MediaPipe's 0.5 defaults:
+    fast lateral motion blurs the hand and the landmark model was trained
+    with little blur augmentation, so at default thresholds the hand is
+    declared absent for several frames in the middle of every fast swipe.
+    Lower presence/tracking keeps the blurred-but-findable hand "present"
+    (gross palm position stays usable long after fingertip precision dies,
+    which is all swipe detection needs). Detection stays near default so
+    re-acquisition after a genuine loss is still fast and non-ghosty."""
+
+    min_detection_confidence: float = 0.5
+    min_presence_confidence: float = 0.4
+    min_tracking_confidence: float = 0.3
 
 
 @dataclass
@@ -137,6 +164,7 @@ class OptionsConfig:
     extended_test: str = "radial"    # "radial" | "y" finger-extension test
     audio_ticks: bool = True         # toggle sound; click ticks stay opt-in
     click_ticks: bool = False
+    debug_gestures: bool = False     # print swipe arming/candidate/reject events
 
 
 # Default bindings match macOS trackpad semantics with a mirrored (selfie)
@@ -164,6 +192,7 @@ class Config:
     scroll: ScrollConfig = field(default_factory=ScrollConfig)
     clutch: ClutchConfig = field(default_factory=ClutchConfig)
     palm: PalmConfig = field(default_factory=PalmConfig)
+    tracking: TrackingConfig = field(default_factory=TrackingConfig)
     suspend: SuspendConfig = field(default_factory=SuspendConfig)
     hands_lost_ms: float = 265.0
     # Pose holds (clutch engage, scroll entry, PALM entry/exit) tolerate up to

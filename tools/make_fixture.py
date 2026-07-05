@@ -108,16 +108,17 @@ def seq_scroll() -> Seq:
 
 
 def _seq_palm_swipe(dx: float, dy: float) -> Seq:
-    """Open palm (PALM mode after 80 ms), then one fast unidirectional swipe.
+    """Arm-at-rest, then one fast flick (the new swipe model).
 
-    ~200 px in 150 ms = 1333 px/s: >1.0 frame-width/s (640) and frame-height/s
-    (480), displacement > 22% of either span — comfortably over both gates
-    even measured from the oldest open-palm sample in the 350 ms window.
+    Open palm held STILL ~250 ms arms the detector (needs the >=80 ms speed
+    baseline plus arm_hold_ms=150 of open-palm-at-rest); the flick then only
+    needs net displacement >= 0.25 of the frame span within 800 ms — the
+    motion frames deliberately need no pose (blur kills it on real data).
     """
     s = Seq()
     s.hold("pointer", _CLUTCH_MS)
-    s.hold("open", 100)
-    s.move_to((320.0 + dx, 240.0 + dy), 150)
+    s.hold("open", 250)                      # arming: open palm at rest
+    s.move_to((320.0 + dx, 240.0 + dy), 150)  # the flick
     s.hold(ms=100)
     s.hold("pointer", ms=300)
     return s

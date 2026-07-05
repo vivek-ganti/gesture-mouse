@@ -95,24 +95,57 @@ to PalmDetector.update(); PALM exits when pose ends (rebase on exit).
 ## palm.py
 
 ```python
+class SwipePhase(Enum): IDLE; ARMING; ARMED; COOLDOWN
+
 class PalmDetector:
-    def __init__(self, cfg: PalmConfig, bindings: dict[str, str]): ...
-    active: bool
+    def __init__(self, cfg: PalmConfig, bindings: dict[str, str],
+                 debug: bool = False): ...
+    active: bool                     # last frame's open-palm flag (preview)
+    last_m: float | None             # latest spread metric (preview meter)
+    last_disp_frac: float            # net swipe travel so far (preview meter)
+    phase: SwipePhase
+    armed: bool                      # property: phase is ARMED
+    engaged: bool                    # property: phase is not IDLE -> engine
+                                     #   holds PALM (cursor frozen) while True
+    events: deque[(ts_ms, str)]      # human-readable events when debug=True;
+                                     #   caller drains and prints (module is pure)
     def update(self, frame: LandmarkFrame, open_palm: bool) -> list[Intent]
-        # swipe: unidirectional anchor velocity > swipe_min_vel_fw_s frame-widths/s
-        # AND displacement > swipe_min_disp_frac within swipe_window_ms, dominant
-        # axis picks direction; TRIGGER intent named by bindings[...]; refractory;
-        # pose must drop before re-trigger.
-        # spread metric m = mean dist(5 fingertips, palm centroid)/scale;
-        # pinch-in: m > spread_open falling below spread_closed within window;
-        # spread-out: m < spread_in_start rising above spread_out within window.
+    def disarm(self) -> None         # engine calls on pinch/scroll entry
     def reset(self) -> None
 ```
 
-Note: spread-out starts from a curled hand (not open palm) — engine also routes
-frames to PalmDetector while the hand is curled-but-present in POINTER with
-cursor speed low, OR simpler: PalmDetector.update is called EVERY frame with the
-open_palm flag; it manages its own windows. Keep it self-contained.
+Swipe model (arm-at-rest -> net displacement; replaces the old per-frame
+velocity/pose-during-motion stack, which never fired on real data):
+
+- ARM: open palm (engine-debounced flag) AND palm-center speed <
+  `arm_max_speed_fw_s`, held `arm_hold_ms` -> ARMED. Pose is tested ONLY here,
+  at rest — motion blur destroys finger landmarks during the swipe itself.
+- Tracked point: PALM CENTER = mean of landmarks {0,5,9,13,17}. Never fingertips.
+- ARMED: origin refreshes every still frame (drift can't accumulate); once
+  motion starts, fire on NET displacement >= `swipe_min_disp_frac` of the
+  frame span, dominant axis >= `swipe_axis_dominance` x the minor, within
+  `swipe_max_duration_ms`. No velocity math.
+- Hand-absent frames NEVER clear the swipe trajectory or disarm unless the
+  gap exceeds `swipe_gap_bridge_ms` — MediaPipe drops the hand for a few
+  frames in the middle of every real fast swipe (blur + tracking-ROI loss).
+- After a fire: `swipe_cooldown_ms`, then a FULL re-arm for the next swipe.
+  Firing also walls off the spread history so the post-swipe hand relaxation
+  can't read as pinch_in/spread_out.
+
+Spread gestures (unchanged): m = mean dist(5 fingertips, palm centroid)/scale;
+pinch-in: m > spread_open falling below spread_closed within spread_window_ms;
+spread-out: m < spread_in_start rising above spread_out. Their history DOES
+clear on hand loss (those gestures happen at rest, where absence is real).
+
+Engine integration: PALM state entry = debounced open-pose hold (`enter_ms`)
+OR `palm.engaged`; exit only when pose gone AND detector back to IDLE (freeze
+survives arm -> swipe -> cooldown; rebase on exit). Swipe-bound intents
+forward from CLUTCH_WAIT / POINTER / PALM / HANDS_LOST (arming is the
+deliberate-intent gate; no cursor clutch required; the detector only emits on
+hand-present frames), never from PINCHED/RIGHT_PINCH/SCROLL — those disarm
+the detector on entry. pinch_in/spread_out keep their PALM-or-slow-POINTER
+forwarding gate. The anchor-teleport -> HANDS_LOST guard is skipped in PALM
+(a real flick moves the anchor >25% of the frame in one frame).
 
 ## tracker.py
 

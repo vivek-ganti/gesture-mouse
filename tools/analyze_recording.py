@@ -63,7 +63,7 @@ def main() -> int:
     store = ConfigStore(str(_ROOT / "config.json"))
     cfg = store.config
     pipeline = CursorPipeline(cfg, 1440.0, 900.0)
-    palm = PalmDetector(cfg.palm, cfg.bindings)
+    palm = PalmDetector(cfg.palm, cfg.bindings, debug=True)
     engine = GestureEngine(cfg, pipeline.pinch, palm)
 
     n = present = 0
@@ -74,6 +74,10 @@ def main() -> int:
     min_left = min_right = float("inf")
     intents: list = []
     first_ts = last_ts = None
+    swipe_events: list[tuple[float, str]] = []
+    gaps_ms: list[float] = []
+    prev_present_ts: float | None = None
+    max_disp = 0.0
 
     while True:
         frame = tracker.read()
@@ -86,6 +90,13 @@ def main() -> int:
         cursor = pipeline.update(frame)
         out = engine.update(frame, cursor)
         intents.extend(out.intents)
+        while palm.events:
+            swipe_events.append(palm.events.popleft())
+        max_disp = max(max_disp, palm.last_disp_frac)
+        if frame.hand_present:
+            if prev_present_ts is not None and frame.ts_ms - prev_present_ts > 50.0:
+                gaps_ms.append(frame.ts_ms - prev_present_ts)
+            prev_present_ts = frame.ts_ms
         if frame.hand_present:
             present += 1
             confs.append(frame.confidence)
@@ -120,7 +131,7 @@ def main() -> int:
               f"range {min(scales):.0f}-{max(scales):.0f}")
     print("\n=== POSES (frames matched) ===")
     print(f"pointer(index only): {poses['pointer']}   "
-          f"open_palm(all 5): {poses['open_palm']}   "
+          f"open_palm(4-finger, thumb ignored): {poses['open_palm']}   "
           f"scroll(index+middle): {poses['scroll(2-finger)']}")
     print(f"pinch reach: min thumb-index {min_left:.2f} "
           f"(engage<{cfg.pinch.left_engage})   "
@@ -133,6 +144,36 @@ def main() -> int:
         counts = Counter(f"{i.name}/{i.phase.value}" for i in intents)
         for k, c in counts.most_common():
             print(f"  {k}: {c}")
+
+    print("\n=== SWIPE DEBUG ===")
+    if gaps_ms:
+        buckets = Counter(
+            "<150ms" if g < 150 else "<350ms" if g < 350 else ">=350ms"
+            for g in gaps_ms
+        )
+        print(f"hand dropouts >50ms: {len(gaps_ms)}  "
+              f"{dict(buckets)}  longest {max(gaps_ms):.0f}ms  "
+              f"(bridge tolerates <{cfg.palm.swipe_gap_bridge_ms:.0f}ms)")
+    else:
+        print("hand dropouts >50ms: none")
+    print(f"max net displacement while armed: {max_disp:.2f} "
+          f"(fire needs >={cfg.palm.swipe_min_disp_frac:.2f})")
+    if swipe_events:
+        rejects = Counter(
+            msg.split("(")[0].strip() for _, msg in swipe_events
+            if "aborted" in msg or "expired" in msg or "disarmed" in msg
+        )
+        if rejects:
+            print(f"rejection histogram: {dict(rejects)}")
+        print("detector events:")
+        for ts, msg in swipe_events:
+            print(f"  [{ts:8.0f}ms] {msg}")
+    else:
+        print("detector events: NONE — arming never even started. If open-palm "
+              "frames exist above, the palm was never both open AND at rest "
+              f"(<{cfg.palm.arm_max_speed_fw_s} fw/s for "
+              f"{cfg.palm.arm_hold_ms:.0f}ms) — hold still a beat before flicking, "
+              "or raise palm.arm_max_speed_fw_s.")
 
     print("\n=== VERDICT ===")
     want = cfg.hand.strip().lower()
