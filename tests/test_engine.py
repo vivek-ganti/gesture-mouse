@@ -379,14 +379,19 @@ def test_palm_mode_freezes_cursor_and_forwards_detector_intents():
     s.hold("pointer", ms=300)        # pose ends -> POINTER with rebase
     intents, _, eng = run(s.frames, cfg=cfg, palm=stub)
 
+    # PALM exit is debounced (pose_jitter_grace_ms) so a single dropped-finger
+    # frame can't cut a gesture short — PALM lingers up to that long past the
+    # pose actually ending, which pushes the window's upper bound out.
+    t_exit_max = t_close + cfg.pose_jitter_grace_ms
+
     trig = named(intents, "space_next")
     assert trig and all(i.phase is Phase.TRIGGER for i in trig)
     # Swipe-style intents are forwarded ONLY while in PALM — never from
     # POINTER (only pinch_in/spread_out bindings get that privilege).
-    assert all(t_open + cfg.palm.enter_ms <= i.ts_ms <= t_close for i in trig)
-    # Cursor frozen in PALM: no move intents between entry and exit.
+    assert all(t_open + cfg.palm.enter_ms <= i.ts_ms <= t_exit_max for i in trig)
+    # Cursor frozen in PALM: no move intents between entry and (debounced) exit.
     assert all(
-        not (t_open + cfg.palm.enter_ms + 1.5 * STEP_MS <= i.ts_ms <= t_close)
+        not (t_open + cfg.palm.enter_ms + 1.5 * STEP_MS <= i.ts_ms <= t_exit_max)
         for i in named(intents, "move")
     )
     # Detector saw EVERY frame, not just PALM ones.

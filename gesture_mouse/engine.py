@@ -97,6 +97,45 @@ class _Arbitration:
     right_min: float
 
 
+class _Debounced:
+    """Tracks how long a per-frame boolean condition has been continuously
+    true, tolerating up to ``grace_ms`` of false readings without resetting
+    the hold — single/double-frame hand-tracking jitter (a finger's radial
+    extension test flickering false for one frame) must not restart a
+    multi-hundred-ms pose hold from zero. Requiring several landmarks to
+    agree at once (all four fingers extended for the open-palm pose) makes
+    this far more likely per-frame than the single-landmark pointer pose, so
+    every pose hold in the engine goes through this, not just palm's.
+
+    ``since`` is the timestamp of the FIRST true sample in the current
+    unbroken (within grace) run — ``ts - since`` is the effective hold
+    duration; ``None`` means "not currently holding"."""
+
+    __slots__ = ("grace_ms", "since", "_false_since")
+
+    def __init__(self, grace_ms: float) -> None:
+        self.grace_ms = grace_ms
+        self.since: float | None = None
+        self._false_since: float | None = None
+
+    def update(self, ts: float, value: bool) -> float | None:
+        if value:
+            self._false_since = None
+            if self.since is None:
+                self.since = ts
+        elif self.since is not None:
+            if self._false_since is None:
+                self._false_since = ts
+            elif ts - self._false_since > self.grace_ms:
+                self.since = None
+                self._false_since = None
+        return self.since
+
+    def reset(self) -> None:
+        self.since = None
+        self._false_since = None
+
+
 class GestureEngine:
     def __init__(
         self,
@@ -118,8 +157,9 @@ class GestureEngine:
     # -- lifecycle ----------------------------------------------------------
 
     def _reset_transients(self, clutch_required: float) -> None:
+        grace = self.cfg.pose_jitter_grace_ms
         self._clutch_required = clutch_required
-        self._clutch_since: float | None = None
+        self._clutch_hold = _Debounced(grace)
         self._cursor_hist: deque[tuple[float, float, float]] = deque()
         self._scale_hist: deque[tuple[float, float]] = deque()
         self._last_ts: float | None = None
@@ -145,17 +185,22 @@ class GestureEngine:
         # Double click window.
         self._last_up: tuple[float, float, float] | None = None  # ts, x, y
         # Scroll (vertical joystick) + tab switch (horizontal joystick).
-        self._scroll_since: float | None = None
+        self._scroll_hold = _Debounced(grace)
         self._scroll_y0 = 0.0
         self._scroll_x0 = 0.0
         self._scroll_exit_since: float | None = None
         self._tab_block_until = float("-inf")
-        # Palm.
-        self._palm_since: float | None = None
+        # Palm: ONE persistent debounced hold of the four-finger open-palm
+        # pose, updated every frame regardless of engine state — its `.since`
+        # value directly gates PALM entry (held >= palm.enter_ms), PALM exit
+        # (exits once the debounced signal itself goes false, which already
+        # absorbed the jitter grace), and the boolean forwarded into the palm
+        # detector (so swipe continuity gets the same jitter tolerance).
+        self._open_palm_hold = _Debounced(grace)
         self._last_open_palm: bool = False   # for the palm_debug readout
         # Hands lost.
         self._lost_since: float | None = None
-        self._reacquire_since: float | None = None
+        self._reacquire_hold = _Debounced(grace)
 
     def reset(self) -> None:
         self.state = EngineState.CLUTCH_WAIT
@@ -323,22 +368,24 @@ class GestureEngine:
     def _enter_hands_lost(self, ts: float) -> None:
         self.state = EngineState.HANDS_LOST
         self._lost_since = ts
-        self._reacquire_since = None
+        self._reacquire_hold.reset()
         self._prev_anchor = None
         self._clear_pinch()
-        self._scroll_since = None
+        self._scroll_hold.reset()
         self._scroll_exit_since = None
-        self._palm_since = None
+        # A real hand-loss invalidates any in-progress open-palm hold outright
+        # rather than waiting out the jitter grace — the grace exists for
+        # brief tracking blips while the hand is still visible, not this.
+        self._open_palm_hold.reset()
         self._release_since = None
         self._release_latch = None
 
     def _to_pointer(self) -> None:
         self.state = EngineState.POINTER
-        self._clutch_since = None
+        self._clutch_hold.reset()
         self._clear_pinch()
-        self._scroll_since = None
+        self._scroll_hold.reset()
         self._scroll_exit_since = None
-        self._palm_since = None
         self._dragging = False
         self._locked_axis = None
         self._release_since = None
@@ -370,12 +417,20 @@ class GestureEngine:
             self._cursor_hist.append((ts, cursor.x, cursor.y))
             while self._cursor_hist and ts - self._cursor_hist[0][0] > _HISTORY_MS:
                 self._cursor_hist.popleft()
-        self._last_open_palm = open_palm
+
+        # Debounced every frame regardless of state: `.since` directly gates
+        # PALM entry (held continuously, within jitter grace, for
+        # palm.enter_ms) and the debounced boolean below is what both PALM
+        # exit and the palm detector see — a single dropped-finger frame mid
+        # gesture can no longer reset progress or cut a swipe/pinch short.
+        open_palm_since = self._open_palm_hold.update(ts, open_palm)
+        open_palm_debounced = open_palm_since is not None
+        self._last_open_palm = open_palm_debounced
 
         # PALM detector sees EVERY frame (it manages its own windows).
         palm_intents: list[Intent] = []
         if self._palm is not None:
-            palm_intents = self._palm.update(frame, open_palm)
+            palm_intents = self._palm.update(frame, open_palm_debounced)
 
         stable = self._scale_stable(ts) if valid else True
 
@@ -396,7 +451,9 @@ class GestureEngine:
         if st is EngineState.CLUTCH_WAIT:
             rebase = self._tick_clutch(frame, cursor, ts, valid)
         elif st is EngineState.POINTER:
-            rebase = self._tick_pointer(frame, cursor, ts, stable, open_palm, intents)
+            rebase = self._tick_pointer(
+                frame, cursor, ts, stable, open_palm_since, intents
+            )
         elif st is EngineState.PINCHED:
             rebase = self._tick_pinched(cursor, ts, stable, intents)
         elif st is EngineState.RIGHT_PINCH:
@@ -404,18 +461,23 @@ class GestureEngine:
         elif st is EngineState.SCROLL:
             rebase = self._tick_scroll(frame, cursor, ts, intents)
         elif st is EngineState.PALM:
-            rebase = self._tick_palm(cursor, open_palm)
+            rebase = self._tick_palm(cursor, open_palm_debounced)
         elif st is EngineState.HANDS_LOST:
             rebase = self._tick_hands_lost(frame, cursor, ts, valid, intents)
 
         # Forward PALM-detector intents: everything while in PALM; the
-        # pinch_in / spread_out bindings also from a slow POINTER hand.
+        # pinch_in / spread_out bindings also from a POINTER hand not moving
+        # wildly (palm.forward_max_speed_px_s — deliberately much more
+        # generous than scroll's entry gate: a five-finger pinch/spread often
+        # completes before PALM's 80ms open-palm hold is reached, especially
+        # spread-out which starts from a fist, so this path carries real
+        # gestures and must not choke on ordinary hand drift while flexing).
         if palm_intents:
             if self.state is EngineState.PALM:
                 intents.extend(palm_intents)
             elif (
                 self.state is EngineState.POINTER
-                and cursor.speed_px_s < self.cfg.scroll.entry_max_speed_px_s
+                and cursor.speed_px_s < self.cfg.palm.forward_max_speed_px_s
             ):
                 allowed = {
                     self.cfg.bindings.get("pinch_in"),
@@ -438,14 +500,11 @@ class GestureEngine:
     def _tick_clutch(
         self, frame: LandmarkFrame, cursor: CursorSample, ts: float, valid: bool
     ) -> tuple[float, float] | None:
-        if valid and frame.landmarks is not None and self._pointer_pose(frame.landmarks):
-            if self._clutch_since is None:
-                self._clutch_since = ts
-            if ts - self._clutch_since >= self._clutch_required:
-                self._to_pointer()
-                return (cursor.x, cursor.y)
-        else:
-            self._clutch_since = None
+        pose = valid and frame.landmarks is not None and self._pointer_pose(frame.landmarks)
+        since = self._clutch_hold.update(ts, pose)
+        if since is not None and ts - since >= self._clutch_required:
+            self._to_pointer()
+            return (cursor.x, cursor.y)
         return None
 
     def _tick_pointer(
@@ -454,7 +513,7 @@ class GestureEngine:
         cursor: CursorSample,
         ts: float,
         stable: bool,
-        open_palm: bool,
+        open_palm_since: float | None,
         intents: list[Intent],
     ) -> tuple[float, float] | None:
         lm = frame.landmarks
@@ -466,37 +525,35 @@ class GestureEngine:
         )
 
         # PALM entry (only with a detector wired in, and no pinch in flight).
-        if self._palm is not None and not pinch_active and open_palm:
-            if self._palm_since is None:
-                self._palm_since = ts
-            if ts - self._palm_since >= self.cfg.palm.enter_ms:
-                self.state = EngineState.PALM
-                self._palm_since = None
-                self._clear_pinch()
-                self._scroll_since = None
-                return None
-        else:
-            self._palm_since = None
+        # open_palm_since is the debounced hold's start ts (already jitter-
+        # tolerant), so entry is a plain duration check against it.
+        if (
+            self._palm is not None
+            and not pinch_active
+            and open_palm_since is not None
+            and ts - open_palm_since >= self.cfg.palm.enter_ms
+        ):
+            self.state = EngineState.PALM
+            self._clear_pinch()
+            self._scroll_hold.reset()
+            return None
 
         # SCROLL entry: pose sustained AND low cursor speed at entry.
         sc = self.cfg.scroll
-        if self._scroll_pose(lm, frame.scale):
-            if self._scroll_since is None:
-                self._scroll_since = ts
-            if (
-                ts - self._scroll_since >= sc.enter_ms
-                and cursor.speed_px_s < sc.entry_max_speed_px_s
-            ):
-                self.state = EngineState.SCROLL
-                self._scroll_since = None
-                self._scroll_exit_since = None
-                self._scroll_y0 = lm[INDEX_MCP].y
-                self._scroll_x0 = lm[INDEX_MCP].x
-                self._clear_pinch()
-                self._palm_since = None
-                return None
-        else:
-            self._scroll_since = None
+        pose = self._scroll_pose(lm, frame.scale)
+        since = self._scroll_hold.update(ts, pose)
+        if (
+            since is not None
+            and ts - since >= sc.enter_ms
+            and cursor.speed_px_s < sc.entry_max_speed_px_s
+        ):
+            self.state = EngineState.SCROLL
+            self._scroll_hold.reset()
+            self._scroll_exit_since = None
+            self._scroll_y0 = lm[INDEX_MCP].y
+            self._scroll_x0 = lm[INDEX_MCP].x
+            self._clear_pinch()
+            return None
 
         down = self._tick_pinch_candidates(lm, cursor, ts, stable)
         if down is not None:
@@ -604,8 +661,7 @@ class GestureEngine:
         self._release_since = None
         self._release_latch = None
         self._clear_pinch()
-        self._scroll_since = None
-        self._palm_since = None
+        self._scroll_hold.reset()
         if cc == 2:
             self._last_up = None  # a double consumes the window (no triples)
         return Intent(
@@ -625,8 +681,7 @@ class GestureEngine:
         self._release_since = None
         self._release_latch = None
         self._clear_pinch()
-        self._scroll_since = None
-        self._palm_since = None
+        self._scroll_hold.reset()
         return None
 
     # -- PINCHED (left held: click pending or dragging) -----------------------
@@ -796,9 +851,12 @@ class GestureEngine:
     # -- PALM (delegated system gestures, cursor frozen) -----------------------
 
     def _tick_palm(
-        self, cursor: CursorSample, open_palm: bool
+        self, cursor: CursorSample, open_palm_debounced: bool
     ) -> tuple[float, float] | None:
-        if open_palm:
+        # open_palm_debounced already absorbed the jitter grace (it only goes
+        # false after grace_ms of sustained non-open frames), so a single
+        # dropped-finger frame mid-gesture can't cut PALM short.
+        if open_palm_debounced:
             return None
         self._to_pointer()
         return (cursor.x, cursor.y)
@@ -821,20 +879,17 @@ class GestureEngine:
         ):
             intents.extend(self._release_held(ts))
 
-        if valid and frame.landmarks is not None and self._pointer_pose(frame.landmarks):
-            if self._reacquire_since is None:
-                self._reacquire_since = ts
-            if ts - self._reacquire_since >= self.cfg.clutch.reacquire_ms:
-                # Safety: if the hand came back fast enough that the auto-UP
-                # never fired, release before handing the cursor back.
-                if self._held is not None:
-                    intents.extend(self._release_held(ts))
-                self._lost_since = None
-                self._reacquire_since = None
-                self._to_pointer()
-                return (cursor.x, cursor.y)
-        else:
-            self._reacquire_since = None
+        pose = valid and frame.landmarks is not None and self._pointer_pose(frame.landmarks)
+        since = self._reacquire_hold.update(ts, pose)
+        if since is not None and ts - since >= self.cfg.clutch.reacquire_ms:
+            # Safety: if the hand came back fast enough that the auto-UP
+            # never fired, release before handing the cursor back.
+            if self._held is not None:
+                intents.extend(self._release_held(ts))
+            self._lost_since = None
+            self._reacquire_hold.reset()
+            self._to_pointer()
+            return (cursor.x, cursor.y)
         return None
 
     def _release_held(self, ts: float) -> list[Intent]:

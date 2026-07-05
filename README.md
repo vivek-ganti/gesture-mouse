@@ -184,6 +184,20 @@ Offline, with a recording:
 sweeping noiseless synthetic fixtures. Everything hot-reloads: edit
 `config.json` while running and the new values apply within a second.
 
+### If a pose-based gesture (swipes, Launchpad, Show Desktop) won't trigger
+
+Requiring several fingers to agree at once is far more sensitive to a single
+noisy tracking frame than the one-finger pointer pose. Every pose hold
+(clutch engage, scroll entry, the four-finger open-palm pose) tolerates up to
+`pose_jitter_grace_ms` (default 120 ms, `config.json` top level) of dropped
+detection without resetting — if gestures still feel unreliable in your
+lighting/camera, raise it a bit. `palm.forward_max_speed_px_s` (default 300)
+caps how fast the cursor can be moving for a five-finger pinch/spread to
+still register while the engine hasn't (yet) recognized the four-finger open
+pose; lower it if accidental Launchpad/Show Desktop triggers happen during
+normal cursor use, raise it if a deliberate gesture with a drifting hand gets
+dropped.
+
 ## Safety model
 
 - **Real input wins, instantly, and stays won.** Every frame, *before* any

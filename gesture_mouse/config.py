@@ -107,6 +107,14 @@ class PalmConfig:
     spread_out: float = 1.0              # spread-out fires when m rises above
     spread_window_ms: float = 500.0
     spread_refractory_ms: float = 800.0
+    # Max cursor speed (px/s) for pinch-in/spread-out to be forwarded while
+    # still in POINTER (i.e. before/without ever entering PALM — spread-out
+    # in particular starts from a fist, so it often completes before the
+    # open-palm pose has been held long enough to enter PALM). Deliberately
+    # far more generous than scroll.entry_max_speed_px_s: a hand naturally
+    # drifts a bit while flexing all five fingers, and this isn't a scroll-
+    # style continuous gesture that needs a still start.
+    forward_max_speed_px_s: float = 300.0
 
 
 @dataclass
@@ -158,6 +166,12 @@ class Config:
     palm: PalmConfig = field(default_factory=PalmConfig)
     suspend: SuspendConfig = field(default_factory=SuspendConfig)
     hands_lost_ms: float = 265.0
+    # Pose holds (clutch engage, scroll entry, PALM entry/exit) tolerate up to
+    # this much continuous non-detection before resetting the hold — absorbs
+    # single/double-frame hand-tracking jitter, which is far more likely when
+    # several landmarks must agree at once (e.g. all four non-thumb fingers
+    # extended for a palm swipe) than for a single-landmark pose.
+    pose_jitter_grace_ms: float = 120.0
     hotkeys: HotkeyConfig = field(default_factory=HotkeyConfig)
     options: OptionsConfig = field(default_factory=OptionsConfig)
     bindings: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_BINDINGS))
