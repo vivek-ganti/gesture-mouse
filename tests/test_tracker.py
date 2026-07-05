@@ -68,3 +68,36 @@ def test_candidate_order_falls_back_to_probing_all_when_name_not_found():
 
     # No crash, no incorrect preference; every index still gets tried.
     assert sorted(order) == [0, 1]
+
+
+def test_trigger_commands_cover_every_system_gesture():
+    """Every TRIGGER intent name in the vocabulary maps to a runnable argv
+    (System Events keystrokes for Spaces/tabs — raw CGEvent chords provably
+    don't trigger macOS's Spaces switcher — and the Mission Control binary
+    for MC/expose/desktop)."""
+    from gesture_mouse.synth import trigger_command
+
+    for name in ("space_prev", "space_next", "mission_control", "app_expose",
+                 "show_desktop", "launchpad", "tab_next", "tab_prev"):
+        argv = trigger_command(name)
+        assert argv, f"no command for {name}"
+        assert argv[0] in ("osascript", "open",
+                           "/System/Applications/Mission Control.app"
+                           "/Contents/MacOS/Mission Control")
+    assert trigger_command("space_prev")[-1].endswith("key code 123 using {control down}")
+    assert trigger_command("tab_prev")[-1].endswith(
+        "key code 48 using {control down, shift down}")
+    assert trigger_command("nonsense") is None
+
+
+def test_spaces_module_imports_and_reads_topology():
+    """spaces.py smoke: imports, SkyLight bridges load, and the topology
+    reader returns either None or a (spaces, index) pair with the active
+    space present. Never switches anything."""
+    from gesture_mouse import spaces
+
+    found = spaces._display_spaces()
+    if found is not None:
+        space_list, idx = found
+        assert 0 <= idx < len(space_list)
+        assert "ManagedSpaceID" in space_list[idx]

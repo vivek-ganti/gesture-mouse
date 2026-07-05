@@ -23,9 +23,16 @@ import Quartz
 from .config import SuspendConfig
 from .synth import Synth, real_cursor_pos
 
-# A keyDown within this window after a synthetic chord / activation keystroke
-# is attributed to that event, not to the user typing.
+# A keyDown within this window after activation is attributed to the toggle
+# hotkey press, not to the user typing.
 _ATTRIB_SLOP_S = 0.10
+# Synthetic chords now go through osascript/System Events (see synth.py):
+# last_chord_ts marks the subprocess LAUNCH, but the keystroke itself lands
+# up to a few hundred ms later, so chord attribution needs a much wider
+# window. Trade-off: real typing within ~1.2s of a fired gesture won't
+# suspend (the mouse guard still will) — acceptable, gestures and typing
+# don't overlap that tightly in practice.
+_CHORD_ATTRIB_S = 1.2
 # Per-frame divergence below this is measurement noise, not a human hand.
 _DIVERGENCE_NOISE_PX = 1.5
 # Posts younger than this can still be "the" applied cursor position.
@@ -91,8 +98,8 @@ class Guards:
         if seconds * 1000.0 >= self._cfg.keyboard_mute_ms:
             return False
         last_keydown = time.monotonic() - seconds
-        if last_keydown <= self._synth.last_chord_ts + _ATTRIB_SLOP_S:
-            return False  # our own synthetic chord
+        if last_keydown <= self._synth.last_chord_ts + _CHORD_ATTRIB_S:
+            return False  # our own (async, osascript-delivered) chord
         if last_keydown <= self._keyboard_baseline + _ATTRIB_SLOP_S:
             return False  # pre-activation keystroke (e.g. the toggle hotkey)
         return True

@@ -24,29 +24,46 @@ log = logging.getLogger(__name__)
 # "mous" — tag identifying every event we synthesize.
 EVENT_TAG = 0x6D6F7573
 
-# TRIGGER name -> (virtual keycode, CGEventFlags) chords.
-_CHORDS: dict[str, tuple[int, int]] = {
-    "space_prev": (123, Quartz.kCGEventFlagMaskControl),        # Ctrl+Left
-    "space_next": (124, Quartz.kCGEventFlagMaskControl),        # Ctrl+Right
-    "mission_control": (126, Quartz.kCGEventFlagMaskControl),   # Ctrl+Up
-    "app_expose": (125, Quartz.kCGEventFlagMaskControl),        # Ctrl+Down
-    "show_desktop": (103, Quartz.kCGEventFlagMaskSecondaryFn),  # fn+F11
-    "tab_next": (48, Quartz.kCGEventFlagMaskControl),           # Ctrl+Tab
-    "tab_prev": (48, Quartz.kCGEventFlagMaskControl             # Ctrl+Shift+Tab
-                 | Quartz.kCGEventFlagMaskShift),
-}
+# TRIGGER name -> subprocess argv. System actions are delivered through
+# external mechanisms, NOT raw CGEvent keyboard chords, after live debugging
+# on real hardware proved that macOS's Spaces switcher ("Move left/right a
+# space") never reacts to synthetic Ctrl+Arrow chords posted via CGEventPost
+# from this process — regardless of flags-on-event, real bracketing modifier
+# key presses, inter-event delays, cursor display, or direction validity —
+# while the exact same chord sent through AppleScript System Events switches
+# the Space within ~1s (verified via SkyLight CGSCopyManagedDisplaySpaces
+# before/after). Mission Control / App Expose / Show Desktop don't need
+# keystrokes at all: the Mission Control binary takes an argument (none =
+# toggle Mission Control, 1 = show desktop, 2 = app windows).
+#
+# All of these run via subprocess.Popen — fire-and-forget, never blocking
+# the 30Hz hot loop. First use of the osascript path triggers a ONE-TIME
+# macOS Automation permission prompt ("... wants to control System Events");
+# permissions.preflight() surfaces it at startup instead of mid-gesture.
+_MC_BIN = "/System/Applications/Mission Control.app/Contents/MacOS/Mission Control"
 
-# CGEventFlags mask -> the (left-side) virtual keycode CGEventCreateKeyboardEvent
-# turns into a real flagsChanged event for that modifier (Carbon HIToolbox
-# Events.h kVK_* constants). Order matters only for readability; posted
-# down in this order, up in reverse.
-_MODIFIER_KEYCODES: tuple[tuple[int, int], ...] = (
-    (Quartz.kCGEventFlagMaskCommand, 55),       # kVK_Command
-    (Quartz.kCGEventFlagMaskShift, 56),         # kVK_Shift
-    (Quartz.kCGEventFlagMaskAlternate, 58),     # kVK_Option
-    (Quartz.kCGEventFlagMaskControl, 59),       # kVK_Control
-    (Quartz.kCGEventFlagMaskSecondaryFn, 63),   # kVK_Function
-)
+
+def _osascript_keystroke(keycode: int, *modifiers: str) -> list[str]:
+    using = ""
+    if modifiers:
+        using = " using {" + ", ".join(f"{m} down" for m in modifiers) + "}"
+    return ["osascript", "-e",
+            f'tell application "System Events" to key code {keycode}{using}']
+
+
+def trigger_command(name: str) -> list[str] | None:
+    """argv for a TRIGGER intent, or None for unknown names (pure; tested)."""
+    commands: dict[str, list[str]] = {
+        "space_prev": _osascript_keystroke(123, "control"),      # Ctrl+Left
+        "space_next": _osascript_keystroke(124, "control"),      # Ctrl+Right
+        "mission_control": [_MC_BIN],
+        "app_expose": [_MC_BIN, "2"],
+        "show_desktop": [_MC_BIN, "1"],
+        "launchpad": ["open", "-a", "Launchpad"],
+        "tab_next": _osascript_keystroke(48, "control"),         # Ctrl+Tab
+        "tab_prev": _osascript_keystroke(48, "control", "shift"),
+    }
+    return commands.get(name)
 
 
 def real_cursor_pos() -> tuple[float, float]:
@@ -118,34 +135,34 @@ class Synth:
         self.has_posted = True
         self.recent_posts.append((time.monotonic(), x, y))
 
-    def _post_chord(self, keycode: int, flags: int) -> None:
-        """Post modifier(s) as REAL flagsChanged key presses bracketing the
-        base key, not just a flags bit set on the base key's own event.
+    def _run_trigger(self, name: str) -> None:
+        """Launch the external command for a TRIGGER intent, fire-and-forget.
 
-        Setting CGEventSetFlags alone is not reliably enough: some apps (and
-        even some system shortcut dispatch) read actual modifier-key state
-        rather than trusting the flags field on an unrelated key event, so a
-        flags-only chord can arrive at the frontmost app as a bare,
-        unmodified key — observed in practice as Ctrl+Left/Right performing
-        a plain arrow-key action (e.g. video seek) instead of switching
-        Spaces. Each active modifier gets its own keyDown before the base
-        key and keyUp after; the base key's own down/up still carry the
-        flags too (redundant, but that's the documented-safe pattern).
-        """
-        mods = [kc for mask, kc in _MODIFIER_KEYCODES if flags & mask]
-        for mod_kc in mods:
-            ev = Quartz.CGEventCreateKeyboardEvent(self._source, mod_kc, True)
-            Quartz.CGEventSetFlags(ev, flags)
-            self._post(ev)
-        for key_down in (True, False):
-            event = Quartz.CGEventCreateKeyboardEvent(
-                self._source, keycode, key_down)
-            Quartz.CGEventSetFlags(event, flags)
-            self._post(event)
-        for mod_kc in reversed(mods):
-            ev = Quartz.CGEventCreateKeyboardEvent(self._source, mod_kc, False)
-            Quartz.CGEventSetFlags(ev, 0)
-            self._post(ev)
+        space_prev/space_next go through spaces.switch_space() FIRST: it
+        activates an app living on the target Space (a public, supported
+        call), which is instant, posts no keystrokes at all (nothing for the
+        keyboard guard to attribute), and needs no Automation permission.
+        Only when it reports no target/candidate (e.g. an empty desktop) do
+        we fall back to the osascript keystroke.
+
+        Popen (never run/wait): the 30Hz hot loop must not stall on process
+        spawn + osascript execution (~100-400ms). last_chord_ts marks the
+        LAUNCH time; the actual keystroke (for the osascript paths) lands up
+        to a few hundred ms later, which is why the keyboard guard attributes
+        keyDowns to us for a generous window after this timestamp."""
+        if name in ("space_prev", "space_next"):
+            from . import spaces  # lazy: AppKit/SkyLight only when first used
+
+            if spaces.switch_space("prev" if name == "space_prev" else "next"):
+                return
+            log.info("%s: no activatable app on target space; osascript fallback",
+                     name)
+        argv = trigger_command(name)
+        if argv is None:
+            log.warning("no trigger command for %s", name)
+            return
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
         self.last_chord_ts = time.monotonic()
 
     # -- intent handlers ------------------------------------------------------
@@ -210,12 +227,8 @@ class Synth:
             self.right_down = False
         elif name == "scroll" and phase is Phase.MOVE:
             self._scroll(float(payload.get("dy_px", 0.0)))
-        elif name in _CHORDS and phase is Phase.TRIGGER:
-            keycode, flags = _CHORDS[name]
-            self._post_chord(keycode, flags)
-        elif name == "launchpad" and phase is Phase.TRIGGER:
-            # No default keyboard shortcut exists for Launchpad.
-            subprocess.Popen(["open", "-a", "Launchpad"])
+        elif phase is Phase.TRIGGER and trigger_command(name) is not None:
+            self._run_trigger(name)
         else:
             log.warning("ignoring unknown intent %s/%s", name, phase.value)
 

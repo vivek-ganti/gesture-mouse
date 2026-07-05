@@ -106,15 +106,46 @@ def deep_link(pane: str) -> None:
     subprocess.run(["open", url], check=False)
 
 
+def automation_status(prompt: bool = False) -> str:
+    """System Events automation consent: 'granted' | 'denied' | 'unknown'.
+
+    Space switching and tab switching are delivered via AppleScript System
+    Events keystrokes (raw CGEvent chords provably don't trigger macOS's
+    Spaces switcher — see synth.py). That path needs the one-time Automation
+    consent ("... wants to control System Events"). prompt=True runs a
+    harmless System Events call so the dialog appears NOW, at startup,
+    rather than the first time a swipe fires mid-session.
+    """
+    import subprocess
+
+    if not prompt:
+        return "unknown"  # no read-only query exists that never prompts
+    try:
+        r = subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to count processes'],
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return "unknown"  # dialog left unanswered
+    if r.returncode == 0:
+        return "granted"
+    return "denied"  # typically AppleEvent error -1743
+
+
 def preflight(require: bool = True) -> bool:
-    """Print the permission checklist; True only if EVERYTHING is granted.
+    """Print the permission checklist; True only if the REQUIRED items
+    (camera + accessibility) are granted.
 
     require=True additionally triggers the OS prompts for whatever is missing
-    (camera consent dialog; Accessibility "add to list" dialog). require=False
-    is strictly read-only — safe for headless/CI runs.
+    (camera consent dialog; Accessibility "add to list" dialog; the System
+    Events Automation consent). require=False is strictly read-only — safe
+    for headless/CI runs.
 
-    The caller refuses a half-permissioned start on False (design: no
-    silently dead synthesis, no surprise dialog mid-session).
+    Automation is reported but NOT gating: without it the cursor, clicks,
+    scroll and Launchpad/Mission Control still work — only the keystroke-
+    based gestures (Spaces switch, tab switch) would silently no-op, which
+    the checklist calls out instead.
     """
     cam = camera_status()
     if require and cam == "undetermined":
@@ -127,6 +158,8 @@ def preflight(require: bool = True) -> bool:
         # Shows the one-time dialog / adds the host app to the pane list.
         accessibility_status(prompt=True)
 
+    auto = automation_status(prompt=require)
+
     cam_ok = cam == "granted"
     print("\ngesture-mouse permission preflight")
     print("(grants attach to the app hosting Python: Terminal/iTerm/IDE)")
@@ -138,9 +171,14 @@ def preflight(require: bool = True) -> bool:
     if not ax_ok:
         print("       enable the host app: System Settings -> Privacy & Security -> Accessibility")
         print(f"       open:  {_PANE_URLS['accessibility']}")
+    auto_tag = "ok" if auto == "granted" else ("!!" if auto == "denied" else "??")
+    print(f"  [{auto_tag}] Automation     {auto}   (Spaces/tab switching via System Events)")
+    if auto == "denied":
+        print("       enable: System Settings -> Privacy & Security -> Automation")
+        print("       -> your terminal app -> System Events")
 
     if cam_ok and ax_ok:
-        print("  all permissions granted.\n")
+        print("  all required permissions granted.\n")
         return True
     print("  missing permissions — grant the items above and start again.\n")
     return False
