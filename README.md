@@ -11,7 +11,7 @@ engine → raw Quartz CGEvents. macOS 15+, Apple Silicon, Python 3.12.
 ```bash
 git clone https://github.com/vivek-ganti/gesture-mouse.git && cd gesture-mouse
 python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m gesture_mouse --start-active
+./gesture-mouse --start-active
 ```
 
 Grant the two permission prompts, then: **hold your index finger up (other
@@ -45,9 +45,9 @@ the panic key can never be silently dead.
 ### Pick a camera
 
 ```bash
-.venv/bin/python -m gesture_mouse --list-cameras    # names only, no camera opened
-.venv/bin/python -m gesture_mouse --bench-cameras   # opens each: read speed + brightness verdict
-.venv/bin/python -m gesture_mouse --camera "FaceTime HD Camera"
+./gesture-mouse --list-cameras    # names only, no camera opened
+./gesture-mouse --bench-cameras   # opens each: read speed + brightness verdict
+./gesture-mouse --camera "FaceTime HD Camera"
 ```
 
 Names are a *preference*, not gospel: macOS enumeration order is unstable and
@@ -71,9 +71,16 @@ Handedness labels also depend on the camera's mirror convention, so
 ## Usage
 
 ```bash
-.venv/bin/python -m gesture_mouse                  # IDLE; ⌃⌥G to start
-.venv/bin/python -m gesture_mouse --start-active   # camera on immediately
+./gesture-mouse                  # IDLE; ⌃⌥G to start
+./gesture-mouse --start-active   # camera on immediately
 ```
+
+`./gesture-mouse` is a launcher script — it finds `.venv` for you (works from
+any directory, e.g. `~/Documents/vivek-code/gesture-mouse/gesture-mouse`), so
+you never have to type `.venv/bin/python -m gesture_mouse` or activate the
+venv yourself. It forwards every flag, e.g. `./gesture-mouse --list-cameras`.
+(`.venv/bin/python -m gesture_mouse ...` still works identically if you
+prefer it or the venv is already active in your shell.)
 
 | Flag | Effect |
 |---|---|
@@ -160,7 +167,7 @@ Offline, with a recording:
 .venv/bin/python tools/record.py --seconds 10 --out me.jsonl   # opens camera
 .venv/bin/python tools/tune.py me.jsonl                        # sweep, headless
 .venv/bin/python tools/make_fixture.py all                     # synthetic fixtures
-.venv/bin/python -m gesture_mouse --replay fixtures/click.jsonl --no-preview
+./gesture-mouse --replay fixtures/click.jsonl --no-preview
 ```
 
 `tools/tune.py` prints jitter_px (RMS motion at rest) and lag_px / lag_ms

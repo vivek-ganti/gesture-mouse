@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Convenience launcher: run from the repo root without activating the venv.
+#   ./gesture-mouse --start-active
+# Forwards every argument straight to `python -m gesture_mouse`.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+exec "$DIR/.venv/bin/python" -m gesture_mouse "$@"
