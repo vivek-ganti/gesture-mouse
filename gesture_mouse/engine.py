@@ -465,25 +465,42 @@ class GestureEngine:
         elif st is EngineState.HANDS_LOST:
             rebase = self._tick_hands_lost(frame, cursor, ts, valid, intents)
 
-        # Forward PALM-detector intents: everything while in PALM; the
-        # pinch_in / spread_out bindings also from a POINTER hand not moving
-        # wildly (palm.forward_max_speed_px_s — deliberately much more
-        # generous than scroll's entry gate: a five-finger pinch/spread often
-        # completes before PALM's 80ms open-palm hold is reached, especially
-        # spread-out which starts from a fist, so this path carries real
-        # gestures and must not choke on ordinary hand drift while flexing).
+        # Forward PALM-detector intents: everything while in PALM; also from
+        # a POINTER hand, because a real open-palm-then-swipe motion is one
+        # fluid gesture that often completes BEFORE the engine has spent
+        # palm.enter_ms formally transitioning its own state to PALM (that
+        # hold is about pose, not motion, so a fast continuous swipe finishes
+        # first) -- gating swipes on "already in PALM" silently dropped
+        # exactly the natural case, not just an edge case.
+        #
+        # Swipes and pinch/spread need different POINTER-side gates:
+        # - Swipes already require open_palm + their own displacement/
+        #   velocity/direction thresholds inside palm.py, and a genuine swipe
+        #   IS fast anchor motion by definition -- also requiring a slow
+        #   CURSOR (palm.forward_max_speed_px_s) would fight the very motion
+        #   being detected, since cursor speed tracks anchor speed. No extra
+        #   gate here.
+        # - pinch_in/spread_out don't require fast motion, so the speed gate
+        #   still does its original job there: don't fire Launchpad/Show
+        #   Desktop just because the cursor is moving normally.
         if palm_intents:
             if self.state is EngineState.PALM:
                 intents.extend(palm_intents)
-            elif (
-                self.state is EngineState.POINTER
-                and cursor.speed_px_s < self.cfg.palm.forward_max_speed_px_s
-            ):
-                allowed = {
+            elif self.state is EngineState.POINTER:
+                swipe_names = {
+                    self.cfg.bindings.get(k) for k in
+                    ("swipe_left", "swipe_right", "swipe_up", "swipe_down")
+                } - {None}
+                pinch_spread_names = {
                     self.cfg.bindings.get("pinch_in"),
                     self.cfg.bindings.get("spread_out"),
                 } - {None}
-                intents.extend(i for i in palm_intents if i.name in allowed)
+                slow_enough = cursor.speed_px_s < self.cfg.palm.forward_max_speed_px_s
+                for i in palm_intents:
+                    if i.name in swipe_names or (
+                        i.name in pinch_spread_names and slow_enough
+                    ):
+                        intents.append(i)
 
         freeze = self.state in (
             EngineState.CLUTCH_WAIT,

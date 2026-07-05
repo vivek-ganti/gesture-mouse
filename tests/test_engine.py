@@ -369,6 +369,12 @@ class _StubPalm:
 
 
 def test_palm_mode_freezes_cursor_and_forwards_detector_intents():
+    """Swipe-bound intents forward from POINTER too now (see
+    test_swipe_bound_intent_forwarded_from_pointer_before_palm_entry for why:
+    a real open-palm-then-swipe motion often completes before the engine has
+    spent palm.enter_ms formally entering PALM), so this test only checks the
+    two invariants that are still PALM-specific: the cursor freezes while in
+    PALM, and the detector sees every single frame regardless of state."""
     cfg = Config()
     stub = _StubPalm()
     s = Seq()
@@ -386,9 +392,6 @@ def test_palm_mode_freezes_cursor_and_forwards_detector_intents():
 
     trig = named(intents, "space_next")
     assert trig and all(i.phase is Phase.TRIGGER for i in trig)
-    # Swipe-style intents are forwarded ONLY while in PALM — never from
-    # POINTER (only pinch_in/spread_out bindings get that privilege).
-    assert all(t_open + cfg.palm.enter_ms <= i.ts_ms <= t_exit_max for i in trig)
     # Cursor frozen in PALM: no move intents between entry and (debounced) exit.
     assert all(
         not (t_open + cfg.palm.enter_ms + 1.5 * STEP_MS <= i.ts_ms <= t_exit_max)
@@ -396,4 +399,49 @@ def test_palm_mode_freezes_cursor_and_forwards_detector_intents():
     )
     # Detector saw EVERY frame, not just PALM ones.
     assert stub.calls == len(s.frames)
+    assert eng.state is EngineState.POINTER
+
+
+def test_swipe_bound_intent_forwarded_from_pointer_before_palm_entry():
+    """The actual bug behind real hand swipes not registering: a natural
+    open-palm-then-swipe motion is one fluid gesture, and palm.py's own
+    swipe detector already requires the open-palm pose plus its own
+    displacement/velocity/direction thresholds -- but the engine used to
+    ALSO require it had separately spent palm.enter_ms transitioning its own
+    state to PALM before forwarding any swipe-bound intent. A hand that
+    opens and swipes fast never satisfies that redundant gate before the
+    swipe itself completes, so a correctly-detected swipe was silently
+    dropped. Reproduced here with the hand NEVER holding the open pose long
+    enough to formally enter PALM at all (a single 'open' frame) -- the
+    swipe-bound stub intent must still be forwarded, purely from POINTER."""
+    cfg = Config()
+    stub = _StubPalm(name="space_next")  # bound to "swipe_left" by default
+    s = Seq()
+    s.hold("pointer", 400)      # clutch engage -> POINTER
+    s.hold("open", ms=STEP_MS)  # a single frame -- nowhere near enter_ms (80ms)
+    intents, _, eng = run(s.frames, cfg=cfg, palm=stub)
+
+    assert named(intents, "space_next")
+    assert eng.state is EngineState.POINTER  # never entered PALM at all
+
+
+def test_pinch_spread_bound_intent_still_gated_by_cursor_speed_from_pointer():
+    """Regression guard for the half of the forwarding logic that must NOT
+    change: pinch_in/spread_out-bound intents don't require fast motion the
+    way swipes do, so the cursor-speed gate still applies to them specifically
+    when forwarded from POINTER (not PALM) -- a fast-moving cursor must not
+    accidentally trigger Launchpad/Show Desktop."""
+    cfg = Config()
+    stub = _StubPalm(name="launchpad")  # bound to "pinch_in" by default
+    s = Seq()
+    s.hold("pointer", 400)                 # clutch engage -> POINTER (stationary)
+    t_fast_start = s.ts
+    s.move_to((320.0 + 200.0, 240.0), 50)  # fast: well over forward_max_speed_px_s
+    intents, _, eng = run(s.frames, cfg=cfg, palm=stub)
+
+    # Stub fires every frame regardless of pose, so it's expected (and fine)
+    # to be forwarded during the earlier STATIONARY pointer hold -- the
+    # invariant under test is specifically that fast motion blocks it.
+    fast_hits = [i for i in named(intents, "launchpad") if i.ts_ms >= t_fast_start]
+    assert fast_hits == [], f"launchpad forwarded during fast motion: {fast_hits}"
     assert eng.state is EngineState.POINTER
