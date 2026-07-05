@@ -71,6 +71,7 @@ class PalmDetector:
         self.cfg = cfg
         self.bindings = bindings
         self.active = False  # True while the last frame had the open-palm pose
+        self.last_m: float | None = None  # latest spread metric, for live tuning UI
         self._samples: deque[_Sample] = deque()
         self._swipe_block_until: float = float("-inf")
         self._need_pose_drop = False  # open_palm must go False before next swipe
@@ -83,6 +84,7 @@ class PalmDetector:
 
     def reset(self) -> None:
         self.active = False
+        self.last_m = None
         self._samples.clear()
         self._swipe_block_until = float("-inf")
         self._need_pose_drop = False
@@ -96,6 +98,7 @@ class PalmDetector:
             self._samples.clear()
             self._need_pose_drop = False
             self.active = False
+            self.last_m = None
             return []
 
         landmarks = frame.landmarks
@@ -103,6 +106,7 @@ class PalmDetector:
         now = frame.ts_ms
         anchor = landmarks[INDEX_MCP]
         m = self._spread_metric(landmarks, frame.scale)
+        self.last_m = m
         self._samples.append(_Sample(now, anchor.x, anchor.y, m, open_palm))
         self._prune(now)
 

@@ -115,14 +115,17 @@ def _draw_meter(
     value: float | None,
     engage: float,
     release: float,
+    full_scale: float = _METER_FULL_SCALE,
+    invert: bool = False,
 ) -> None:
     def to_x(v: float) -> int:
-        frac = min(max(v / _METER_FULL_SCALE, 0.0), 1.0)
+        frac = min(max(v / full_scale, 0.0), 1.0)
         return x + int(frac * bar_w)
 
     cv2.rectangle(canvas, (x, y), (x + bar_w, y + bar_h), _GRAY, 1)
     if value is not None:
-        fill = _GREEN if value <= engage else (110, 110, 110)
+        armed = value >= engage if invert else value <= engage
+        fill = _GREEN if armed else (110, 110, 110)
         cv2.rectangle(
             canvas, (x + 1, y + 1), (max(to_x(value) - 1, x + 1), y + bar_h - 1), fill, -1
         )
@@ -151,6 +154,27 @@ def _draw_pinch_meters(
         y += bar_h + gap
 
 
+def _draw_palm_meter(
+    canvas: np.ndarray, palm_debug: dict[str, float | bool], cfg: Config
+) -> None:
+    """Five-finger spread metric (Launchpad = falls below spread_closed;
+    Show Desktop = rises above spread_out) plus the four-finger open-palm
+    pose flag that arms swipes. Sits directly above the pinch meters."""
+    h = canvas.shape[0]
+    bar_w, bar_h, gap = 160, 10, 8
+    y = h - gap - bar_h - 2 * (bar_h + gap)   # one row above the 2 pinch meters
+    m = palm_debug.get("m")
+    m_val = m if isinstance(m, float) else None
+    _draw_meter(
+        canvas, gap, y, bar_w, bar_h, "P", m_val,
+        cfg.palm.spread_closed, cfg.palm.spread_open, full_scale=1.4,
+    )
+    open_now = bool(palm_debug.get("open"))
+    tag, color = ("4-FINGER OPEN", _GREEN) if open_now else ("", _WHITE)
+    if tag:
+        _put_text(canvas, tag, (gap + bar_w + 90, y + bar_h - 1), color, 0.4)
+
+
 def _draw_banner(canvas: np.ndarray, text: str, y: int, bg: tuple[int, int, int]) -> int:
     """Full-width band with centered text; returns the y below the band."""
     w = canvas.shape[1]
@@ -177,6 +201,22 @@ def _draw_status(canvas: np.ndarray, snap: StateSnapshot) -> None:
     _put_text(canvas, text, (8, 18), _state_color(snap))
 
 
+def _draw_camera_list(
+    canvas: np.ndarray, cameras: list[str], current_index: int | None, y: int
+) -> int:
+    """Top-right numbered camera list; the active one is highlighted. Press
+    the matching digit key (1-9) to switch. Returns the y below the list."""
+    w = canvas.shape[1]
+    for i, name in enumerate(cameras[:9]):
+        current = i == current_index
+        label = f"[{i + 1}] {name}" + ("  *" if current else "")
+        color = _GREEN if current else _GRAY
+        (tw, _), _ = cv2.getTextSize(label, _FONT, 0.42, 1)
+        _put_text(canvas, label, (w - tw - 8, y), color, 0.42)
+        y += 16
+    return y
+
+
 def draw_overlay(
     canvas: np.ndarray,
     lm_frame: LandmarkFrame | None,
@@ -184,6 +224,9 @@ def draw_overlay(
     pinch_values: dict[str, float],
     cfg: Config,
     show_box: bool = True,
+    palm_debug: dict[str, float | bool] | None = None,
+    cameras: list[str] | None = None,
+    current_camera_index: int | None = None,
 ) -> np.ndarray:
     """Draw all preview widgets onto ``canvas`` (in place) and return it.
 
@@ -195,8 +238,12 @@ def draw_overlay(
         _draw_control_box(canvas, cfg)
     if lm_frame is not None and lm_frame.hand_present:
         _draw_skeleton(canvas, lm_frame, _state_color(snap))
+    if palm_debug is not None:
+        _draw_palm_meter(canvas, palm_debug, cfg)
     _draw_pinch_meters(canvas, pinch_values, cfg)
     _draw_status(canvas, snap)
+    if cameras:
+        _draw_camera_list(canvas, cameras, current_camera_index, 16)
 
     banner_y = 28
     if snap.session_state is SessionState.WARMUP:
@@ -220,9 +267,17 @@ class Preview:
         lm_frame: LandmarkFrame | None,
         snap: StateSnapshot,
         pinch_values: dict[str, float],
+        palm_debug: dict[str, float | bool] | None = None,
+        cameras: list[str] | None = None,
+        current_camera_index: int | None = None,
     ) -> int:
         """Render one frame; returns the ``cv2.waitKey(1)`` key code (-1 when
-        no key was pressed). ``waitKey`` also pumps the Cocoa event loop."""
+        no key was pressed). ``waitKey`` also pumps the Cocoa event loop.
+
+        ``cameras`` (all enumerated camera names) + ``current_camera_index``
+        draw the on-screen camera picker (press 1-9 to switch); both default
+        to None so callers that don't offer switching (replay) need no change.
+        """
         if lm_frame is not None:
             w, h = lm_frame.img_w, lm_frame.img_h
         elif bgr_frame is not None:
@@ -236,7 +291,8 @@ class Preview:
             canvas = bgr_frame.copy()  # never draw on the caller's frame
 
         draw_overlay(canvas, lm_frame, snap, pinch_values, self._cfg,
-                     show_box=self.show_box)
+                     show_box=self.show_box, palm_debug=palm_debug,
+                     cameras=cameras, current_camera_index=current_camera_index)
 
         if not self._opened:
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)

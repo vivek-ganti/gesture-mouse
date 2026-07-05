@@ -47,7 +47,6 @@ from .types import (
     PINKY_TIP,
     RING_PIP,
     RING_TIP,
-    THUMB_IP,
     THUMB_TIP,
     WRIST,
     CursorSample,
@@ -153,6 +152,7 @@ class GestureEngine:
         self._tab_block_until = float("-inf")
         # Palm.
         self._palm_since: float | None = None
+        self._last_open_palm: bool = False   # for the palm_debug readout
         # Hands lost.
         self._lost_since: float | None = None
         self._reacquire_since: float | None = None
@@ -183,6 +183,17 @@ class GestureEngine:
             out["right"] = self._right_val
         return out
 
+    @property
+    def palm_debug(self) -> dict[str, float | bool]:
+        """Live palm-gesture tuning readout (additive to the CONTRACTS.md
+        surface): whether the four-finger pose is currently held, and the
+        continuous five-finger spread metric (Launchpad/Show Desktop) against
+        which ``palm.spread_closed`` / ``palm.spread_open`` are compared."""
+        out: dict[str, float | bool] = {"open": self._last_open_palm}
+        if self._palm is not None and self._palm.last_m is not None:
+            out["m"] = self._palm.last_m
+        return out
+
     # -- pose tests ---------------------------------------------------------
 
     def _ext(self, lm: tuple[Point, ...], tip: int, pip: int, wrist: Point) -> bool:
@@ -206,10 +217,22 @@ class GestureEngine:
         )
 
     def _open_palm_pose(self, lm: tuple[Point, ...]) -> bool:
+        """Four fingers extended — deliberately EXCLUDES the thumb.
+
+        The trackpad gesture this mirrors ("4-finger swipe") never needed the
+        thumb either, and the thumb's radial-from-wrist extension test is the
+        least reliable of the five: the thumb's range of motion is mostly
+        lateral (across the palm), not radial from the wrist, so on a real
+        hand it very often reads as "curled" even when visibly splayed out —
+        silently blocking every four/five-finger gesture behind a pose that
+        can almost never be satisfied. Five-finger pinch-in/spread-out
+        (Launchpad/Show Desktop) don't use this pose test at all — they
+        already read the thumb through the continuous spread metric in
+        palm.py, which has no such failure mode.
+        """
         w = lm[WRIST]
         return (
-            self._ext(lm, THUMB_TIP, THUMB_IP, w)
-            and self._ext(lm, INDEX_TIP, INDEX_PIP, w)
+            self._ext(lm, INDEX_TIP, INDEX_PIP, w)
             and self._ext(lm, MIDDLE_TIP, MIDDLE_PIP, w)
             and self._ext(lm, RING_TIP, RING_PIP, w)
             and self._ext(lm, PINKY_TIP, PINKY_PIP, w)
@@ -347,6 +370,7 @@ class GestureEngine:
             self._cursor_hist.append((ts, cursor.x, cursor.y))
             while self._cursor_hist and ts - self._cursor_hist[0][0] > _HISTORY_MS:
                 self._cursor_hist.popleft()
+        self._last_open_palm = open_palm
 
         # PALM detector sees EVERY frame (it manages its own windows).
         palm_intents: list[Intent] = []

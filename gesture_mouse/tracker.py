@@ -303,6 +303,43 @@ class CameraTracker:
             if fallback is not None and self._cap is not fallback[0]:
                 fallback[0].release()
 
+    @property
+    def source(self) -> str:
+        """Name of the camera currently in use (as returned by list_cameras())."""
+        return self._source
+
+    def switch_camera(self, index: int) -> str | None:
+        """Hot-switch to camera ``index`` (from ``list_cameras()``): the
+        landmarker and its timestamp clock are untouched, only the capture
+        device changes. Returns the new camera's name on success, None on
+        failure — in which case the PREVIOUS camera is left open and
+        streaming, so a bad switch never drops the feed.
+
+        Requires ``open()`` to have been called (there must be a current
+        capture to fall back to); IDLE has no camera to switch.
+        """
+        if self._cap is None:
+            return None
+        cams = list_cameras()
+        if index < 0 or index >= len(cams):
+            return None
+        label = cams[index]
+        cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        cam = self._cfg.camera
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam.height)
+        cap.set(cv2.CAP_PROP_FPS, cam.fps)
+        read_ms, bright = self._probe_cap(cap)
+        if read_ms >= 500.0 or bright < 0.5:
+            cap.release()  # looks dead: keep the camera that was working
+            return None
+        old_cap, self._cap = self._cap, cap
+        self._source = label
+        old_cap.release()
+        return label
 
     def _make_landmarker(self) -> Any:
         # Imported lazily so merely importing tracker.py stays cheap and

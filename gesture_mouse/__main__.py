@@ -53,6 +53,7 @@ _WARMUP_MIN_CONF = 0.5     # a hand this confident ends WARMUP early
 _CAMERA_FAIL_MAX_S = 5.0   # continuous grab failure before dropping to IDLE
 _IDLE_TICK_S = 0.05        # IDLE poll cadence (camera off; nearly zero CPU)
 _RELOAD_PERIOD_S = 1.0     # config.json mtime poll cadence
+_CAMERA_REFRESH_PERIOD_S = 3.0  # camera-list re-enumeration cadence
 _PERF_PERIOD_S = 5.0       # PerfTimer print cadence
 _TUNE_STEP = 1.25          # [ ] multiplicative step for mincutoff
 _BETA_STEP = 1.5           # ; ' multiplicative step for beta
@@ -179,6 +180,11 @@ class App:
         self._next_reload = time.monotonic() + _RELOAD_PERIOD_S
         self._quit = False
         self._cleaned = False
+        # Camera picker: press 1-9 in the preview window to switch. The list
+        # is cheap to enumerate but not free, so it's cached and refreshed
+        # only periodically (new devices attach/detach rarely, mid-session).
+        self._camera_names: list[str] = [] if self.replay_mode else list_cameras()
+        self._next_camera_refresh = time.monotonic() + _CAMERA_REFRESH_PERIOD_S
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -276,7 +282,7 @@ class App:
 
     def _handle_key(self, key: int) -> None:
         """Live-tune keys from cv2.waitKey: [ ] mincutoff, ; ' beta,
-        b box overlay, p privacy, q quit."""
+        b box overlay, p privacy, 1-9 switch camera, q quit."""
         if key < 0:
             return
         ch = chr(key & 0xFF) if 32 <= (key & 0xFF) < 127 else ""
@@ -302,6 +308,50 @@ class App:
             opts = self.cfg.options
             opts.privacy_preview = not opts.privacy_preview
             print(f"[tune] privacy preview {'on' if opts.privacy_preview else 'off'}")
+        elif ch.isdigit() and ch != "0":
+            self._switch_camera(int(ch) - 1)
+
+    def _switch_camera(self, index: int) -> None:
+        """Digit-key camera picker (see the numbered list drawn in the
+        preview). If a camera is currently open, switches it live and resets
+        tracking state (a different physical device invalidates the filters'
+        motion history and the engine's pinch/hand-loss timers). If not
+        (IDLE, or --no-preview never enumerated it), just records the
+        preference for the next activation. Either way the choice is
+        persisted to config.json so it survives a restart."""
+        if index < 0 or index >= len(self._camera_names):
+            print(f"[camera] no camera at slot {index + 1}")
+            return
+        name = self._camera_names[index]
+        if isinstance(self.tracker, CameraTracker):
+            switched = self.tracker.switch_camera(index)
+            if switched is None:
+                print(f"[camera] switch to {name!r} failed — staying on "
+                      f"{self.tracker.source!r}")
+                return
+            self.pipeline.reset()
+            self.engine.reset()
+            self._seed_cursor()
+            print(f"[camera] switched to {switched!r}")
+        else:
+            print(f"[camera] will use {name!r} next time the camera opens")
+        self.cfg.camera.name = name
+        self.store.save()
+
+    def _maybe_refresh_cameras(self) -> None:
+        now = time.monotonic()
+        if now < self._next_camera_refresh:
+            return
+        self._next_camera_refresh = now + _CAMERA_REFRESH_PERIOD_S
+        self._camera_names = list_cameras()
+
+    def _current_camera_index(self) -> int | None:
+        if not isinstance(self.tracker, CameraTracker):
+            return None
+        try:
+            return self._camera_names.index(self.tracker.source)
+        except ValueError:
+            return None
 
     def _maybe_reload_config(self) -> None:
         now = time.monotonic()
@@ -429,11 +479,16 @@ class App:
         return 0
 
     def _idle_tick(self) -> None:
+        self._maybe_refresh_cameras()
         snap = self._snapshot(hand_present=False)
         if self.indicator is not None:
             self.indicator.set_state(snap)
         if self.preview is not None:
-            self._handle_key(self.preview.show(None, None, snap, {}))
+            key = self.preview.show(
+                None, None, snap, {}, cameras=self._camera_names,
+                current_camera_index=self._current_camera_index(),
+            )
+            self._handle_key(key)
         time.sleep(_IDLE_TICK_S)
 
     def _frame_tick(self) -> None:
@@ -499,23 +554,34 @@ class App:
             return
         if fail_ms >= self.cfg.hands_lost_ms and self.session is SessionState.ACTIVE:
             self._suspend("camera")  # release_all + engine.notify_suspended
+        self._maybe_refresh_cameras()
         snap = self._snapshot(hand_present=False)
         if self.indicator is not None:
             self.indicator.set_state(snap)
         if self.preview is not None:
-            self._handle_key(self.preview.show(None, None, snap, {}))
+            key = self.preview.show(
+                None, None, snap, {}, cameras=self._camera_names,
+                current_camera_index=self._current_camera_index(),
+            )
+            self._handle_key(key)
         time.sleep(0.01)
 
     def _finish_tick(self, t0: float, frame: LandmarkFrame) -> None:
         t3 = time.perf_counter()
         self._update_rates(t0)
+        self._maybe_refresh_cameras()
         snap = self._snapshot(frame.hand_present)
         if self.indicator is not None:
             self.indicator.set_state(snap)
         if self.preview is not None:
             assert isinstance(self.tracker, CameraTracker)
             bgr = None if self.cfg.options.privacy_preview else self.tracker.last_bgr
-            self._handle_key(self.preview.show(bgr, frame, snap, self.engine.pinch_values))
+            key = self.preview.show(
+                bgr, frame, snap, self.engine.pinch_values,
+                palm_debug=self.engine.palm_debug, cameras=self._camera_names,
+                current_camera_index=self._current_camera_index(),
+            )
+            self._handle_key(key)
         self.perf.add("ui", (time.perf_counter() - t3) * 1e3)
         self.perf.maybe_print()
         self._maybe_reload_config()
@@ -581,7 +647,8 @@ class App:
             if self.preview is not None:
                 snap = self._snapshot(frame.hand_present)
                 self._handle_key(
-                    self.preview.show(None, frame, snap, self.engine.pinch_values)
+                    self.preview.show(None, frame, snap, self.engine.pinch_values,
+                                       palm_debug=self.engine.palm_debug)
                 )
             self.perf.maybe_print()
             n_frames += 1

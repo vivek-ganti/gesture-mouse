@@ -89,11 +89,27 @@ Hotkeys (global, configurable in `config.json`): **⌃⌥G** toggle IDLE⇄ACTIV
 
 Live-tune keys (preview window focused): `[` / `]` mincutoff down/up ·
 `;` / `'` beta down/up · `b` control-box overlay · `p` privacy mode ·
-`q` quit. PerfTimer prints per-stage p50/p95 every 5 s.
+**`1`-`9` switch camera** · `q` quit. PerfTimer prints per-stage p50/p95 every 5 s.
 
 The corner dot shows state everywhere (incl. fullscreen): gray idle · pulsing
 warmup · white clutch-wait · green pointer · blue pinched · purple scroll ·
 orange palm · yellow hands-lost · red suspended (M/K = mouse/keyboard reason).
+
+### Switching cameras
+
+The preview window (top-right) lists every camera it can see, numbered, with
+the active one marked `*` in green:
+
+```
+[1] FaceTime HD Camera
+[2] Iriun Camera  *
+```
+
+Press the matching digit key to switch — live, mid-session, without
+restarting. If a camera is already open it hot-swaps instantly (falling back
+to the previous one if the new device turns out dead/black); the choice is
+also written to `config.json` so it's remembered next launch. The list
+re-scans for new devices every few seconds.
 
 ## Gesture cheat sheet
 
@@ -107,13 +123,22 @@ orange palm · yellow hands-lost · red suspended (M/K = mouse/keyboard reason).
 | Right click | Thumb–**middle** pinch, index kept extended | Tap-only |
 | Scroll | Index+middle extended and together, ring+pinky folded → vertical joystick | Entry needs the pose 100 ms *and* a slow cursor; cursor frozen while scrolling |
 | Tab switch | Same two-finger scroll pose → flick **horizontally** | Right = next tab (Ctrl+Tab), left = previous (Ctrl+Shift+Tab); one per flick, 500 ms refractory |
-| Space left/right | Open palm, swipe left/right | Open palm = system-gesture mode, cursor frozen |
-| Mission Control | Open palm, swipe up | |
-| App Exposé | Open palm, swipe down | |
-| Launchpad | Five-finger pinch-in (open palm → fist) | |
-| Show Desktop | Five-finger spread-out (fist → open palm) | |
+| Space left/right | **Four**-finger open palm (thumb ignored), swipe left/right | Open palm = system-gesture mode, cursor frozen |
+| Mission Control | Four-finger open palm, swipe up | |
+| App Exposé | Four-finger open palm, swipe down | |
+| Launchpad | Five-finger pinch-in (open palm → fist) | Uses the continuous spread meter (bottom-left "P" bar), not the four-finger pose |
+| Show Desktop | Five-finger spread-out (fist → open palm) | Same meter, opposite direction |
 | Suspend / resume | Grab the real mouse or type / pointer pose 250 ms or ⌃⌥G | See safety model |
 | Panic | ⌃⌥Esc | Buttons released, camera off |
+
+The "open palm" pose that arms the four swipes deliberately **ignores the
+thumb** — the thumb's extension is much less reliable to detect than the
+other four fingers (it moves sideways across the palm, not radially from the
+wrist), and matching how a real trackpad's 4-finger swipe already works costs
+nothing. Launchpad/Show Desktop don't use this pose at all; they read a
+continuous five-finger spread value instead, shown live as the "P" meter in
+the preview window (bottom-left, above the L/R pinch meters) — watch it swing
+as you open/close your hand to see exactly where the thresholds sit.
 
 Bindings for the six system gestures are remappable in `config.json`
 (`bindings`: swipe_left/right/up/down, pinch_in, spread_out → any of
