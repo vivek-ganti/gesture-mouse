@@ -36,6 +36,18 @@ _CHORDS: dict[str, tuple[int, int]] = {
                  | Quartz.kCGEventFlagMaskShift),
 }
 
+# CGEventFlags mask -> the (left-side) virtual keycode CGEventCreateKeyboardEvent
+# turns into a real flagsChanged event for that modifier (Carbon HIToolbox
+# Events.h kVK_* constants). Order matters only for readability; posted
+# down in this order, up in reverse.
+_MODIFIER_KEYCODES: tuple[tuple[int, int], ...] = (
+    (Quartz.kCGEventFlagMaskCommand, 55),       # kVK_Command
+    (Quartz.kCGEventFlagMaskShift, 56),         # kVK_Shift
+    (Quartz.kCGEventFlagMaskAlternate, 58),     # kVK_Option
+    (Quartz.kCGEventFlagMaskControl, 59),       # kVK_Control
+    (Quartz.kCGEventFlagMaskSecondaryFn, 63),   # kVK_Function
+)
+
 
 def real_cursor_pos() -> tuple[float, float]:
     """Current *actual* cursor position (needs no TCC permission)."""
@@ -107,12 +119,33 @@ class Synth:
         self.recent_posts.append((time.monotonic(), x, y))
 
     def _post_chord(self, keycode: int, flags: int) -> None:
-        # Flags must be set on BOTH down and up or the modifier is dropped.
+        """Post modifier(s) as REAL flagsChanged key presses bracketing the
+        base key, not just a flags bit set on the base key's own event.
+
+        Setting CGEventSetFlags alone is not reliably enough: some apps (and
+        even some system shortcut dispatch) read actual modifier-key state
+        rather than trusting the flags field on an unrelated key event, so a
+        flags-only chord can arrive at the frontmost app as a bare,
+        unmodified key — observed in practice as Ctrl+Left/Right performing
+        a plain arrow-key action (e.g. video seek) instead of switching
+        Spaces. Each active modifier gets its own keyDown before the base
+        key and keyUp after; the base key's own down/up still carry the
+        flags too (redundant, but that's the documented-safe pattern).
+        """
+        mods = [kc for mask, kc in _MODIFIER_KEYCODES if flags & mask]
+        for mod_kc in mods:
+            ev = Quartz.CGEventCreateKeyboardEvent(self._source, mod_kc, True)
+            Quartz.CGEventSetFlags(ev, flags)
+            self._post(ev)
         for key_down in (True, False):
             event = Quartz.CGEventCreateKeyboardEvent(
                 self._source, keycode, key_down)
             Quartz.CGEventSetFlags(event, flags)
             self._post(event)
+        for mod_kc in reversed(mods):
+            ev = Quartz.CGEventCreateKeyboardEvent(self._source, mod_kc, False)
+            Quartz.CGEventSetFlags(ev, 0)
+            self._post(ev)
         self.last_chord_ts = time.monotonic()
 
     # -- intent handlers ------------------------------------------------------
