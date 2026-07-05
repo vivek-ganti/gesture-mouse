@@ -6,7 +6,8 @@
     "fps": 30,
     "mirror": true,
     "rotate": 0,
-    "orientation": "front"
+    "orientation": "front",
+    "backend": "avf"
   },
   "hand": "auto",
   "control_box": {
@@ -108,5 +109,17 @@
     "swipe_down": "app_expose",
     "pinch_in": "launchpad",
     "spread_out": "show_desktop"
-  }
+  },
+  "custom_gestures": [
+    {
+      "name": "dictate",
+      "pose": "horns",
+      "hold_ms": 300.0,
+      "cooldown_ms": 1200.0,
+      "action": {
+        "type": "key",
+        "key": "option"
+      }
+    }
+  ]
 }

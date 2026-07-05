@@ -206,6 +206,20 @@ def _draw_banner(canvas: np.ndarray, text: str, y: int, bg: tuple[int, int, int]
     return y + band_h + 4
 
 
+# State -> what-to-do-next, shown as a second status line. Usability: the
+# user should never have to remember the state machine — the UI says what
+# the current state expects.
+_HINTS: dict[EngineState, str] = {
+    EngineState.CLUTCH_WAIT: "hold INDEX FINGER up ~150ms for cursor, or open hand still + flick to swipe",
+    EngineState.POINTER: "pinch=click  thumb+middle=right  2 fingers=scroll  open hand still=swipe  horns=custom",
+    EngineState.PINCHED: "move to drag, open fingers to release",
+    EngineState.RIGHT_PINCH: "release quickly for right-click",
+    EngineState.SCROLL: "move up/down to scroll, flick sideways for tabs, relax to exit",
+    EngineState.PALM: "flick now to swipe (or relax to cancel)",
+    EngineState.HANDS_LOST: "show your hand + hold index finger up 250ms",
+}
+
+
 def _draw_status(canvas: np.ndarray, snap: StateSnapshot) -> None:
     engine = snap.engine_state.value if snap.engine_state else "-"
     text = (
@@ -217,6 +231,75 @@ def _draw_status(canvas: np.ndarray, snap: StateSnapshot) -> None:
     if not snap.hand_present:
         text += "  (no hand)"
     _put_text(canvas, text, (8, 18), _state_color(snap))
+
+    if snap.session_state is SessionState.SUSPENDED:
+        hint = "you used mouse/keyboard - hold index finger up 250ms (or ctrl+alt+G) to resume"
+    elif snap.session_state is SessionState.IDLE:
+        hint = "press ctrl+alt+G to start"
+    elif snap.engine_state is not None:
+        hint = _HINTS.get(snap.engine_state, "")
+    else:
+        hint = ""
+    if hint:
+        _put_text(canvas, hint, (8, 36), _GRAY, 0.4)
+
+
+_HELP_LINES: tuple[tuple[str, str], ...] = (
+    ("GESTURES", ""),
+    ("index finger up 150ms", "take the cursor (clutch)"),
+    ("thumb+index pinch", "left click (two taps = double)"),
+    ("thumb+middle pinch", "right click (index stays up)"),
+    ("pinch + move", "drag"),
+    ("index+middle up, move", "scroll / flick sideways = switch tabs"),
+    ("open hand STILL, then flick", "left/right = Spaces, up = Mission Control, down = App Expose"),
+    ("open palm -> fist", "Launchpad"),
+    ("fist -> open palm", "Show Desktop"),
+    ("KEYS", ""),
+    ("h", "toggle this help"),
+    ("1-9", "switch camera (list top-right)"),
+    ("[ ] and ; '", "tune smoothing / responsiveness"),
+    ("p / b / q", "privacy view / control box / quit"),
+    ("SAFETY", ""),
+    ("touch mouse or type", "gestures suspend instantly"),
+    ("ctrl+alt+G / ctrl+alt+esc", "toggle on-off / panic stop"),
+)
+
+
+def _draw_help(canvas: np.ndarray, cfg: Config) -> None:
+    """Semi-transparent guide panel: gestures, keys, safety, plus whatever
+    custom gestures the config defines (so the guide is never stale)."""
+    lines: list[tuple[str, str]] = list(_HELP_LINES)
+    customs = [g for g in (getattr(cfg, "custom_gestures", None) or [])
+               if isinstance(g, dict) and g.get("pose")]
+    if customs:
+        lines.append(("CUSTOM (config.json)", ""))
+        for g in customs:
+            act = g.get("action") or {}
+            if act.get("type") == "key":
+                desc = "press " + "+".join(
+                    list(act.get("modifiers") or []) + [str(act.get("key", "?"))])
+            elif act.get("type") == "shell":
+                desc = "run " + " ".join(act.get("argv") or ["?"])
+            else:
+                desc = str(act.get("name", act.get("type", "?")))
+            lines.append((f"{g.get('pose')} pose ({g.get('name')})", desc))
+
+    h, w = canvas.shape[:2]
+    pad, line_h = 14, 17
+    panel_h = pad * 2 + line_h * len(lines)
+    panel_w = min(w - 20, 560)
+    x0, y0 = (w - panel_w) // 2, max(44, (h - panel_h) // 2)
+    sub = canvas[y0:y0 + panel_h, x0:x0 + panel_w]
+    sub[:] = (sub * 0.25).astype(sub.dtype)          # darken, keep context
+    cv2.rectangle(canvas, (x0, y0), (x0 + panel_w, y0 + panel_h), _GRAY, 1)
+    y = y0 + pad + 4
+    for left_txt, right_txt in lines:
+        if not right_txt:                            # section header
+            _put_text(canvas, left_txt, (x0 + pad, y), _GREEN, 0.45)
+        else:
+            _put_text(canvas, left_txt, (x0 + pad, y), _WHITE, 0.42)
+            _put_text(canvas, right_txt, (x0 + pad + 210, y), _GRAY, 0.42)
+        y += line_h
 
 
 def _draw_camera_list(
@@ -245,6 +328,7 @@ def draw_overlay(
     palm_debug: dict[str, float | bool] | None = None,
     cameras: list[str] | None = None,
     current_camera_index: int | None = None,
+    show_help: bool = False,
 ) -> np.ndarray:
     """Draw all preview widgets onto ``canvas`` (in place) and return it.
 
@@ -262,6 +346,10 @@ def draw_overlay(
     _draw_status(canvas, snap)
     if cameras:
         _draw_camera_list(canvas, cameras, current_camera_index, 16)
+    # The guide doubles as the IDLE screen (nothing else to show there), and
+    # is toggleable any time with 'h'.
+    if show_help or snap.session_state is SessionState.IDLE:
+        _draw_help(canvas, cfg)
 
     banner_y = 28
     if snap.session_state is SessionState.WARMUP:
@@ -277,7 +365,8 @@ class Preview:
     def __init__(self, cfg: Config) -> None:
         self._cfg = cfg
         self._opened = False
-        self.show_box = True  # control-box overlay toggle ('b' key)
+        self.show_box = True   # control-box overlay toggle ('b' key)
+        self.show_help = False  # guide overlay toggle ('h' key; auto in IDLE)
 
     def show(
         self,
@@ -310,7 +399,8 @@ class Preview:
 
         draw_overlay(canvas, lm_frame, snap, pinch_values, self._cfg,
                      show_box=self.show_box, palm_debug=palm_debug,
-                     cameras=cameras, current_camera_index=current_camera_index)
+                     cameras=cameras, current_camera_index=current_camera_index,
+                     show_help=self.show_help)
 
         if not self._opened:
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)

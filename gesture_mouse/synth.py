@@ -66,6 +66,51 @@ def trigger_command(name: str) -> list[str] | None:
     return commands.get(name)
 
 
+# Key names accepted by custom {"type": "key"} actions. Bare modifiers are
+# first-class: tapping Option is e.g. Wispr Flow's dictation toggle. Letters,
+# digits and the common named keys reuse the hotkey parser's keycode table.
+_MODIFIER_KEYCODES: dict[str, int] = {
+    "command": 55, "cmd": 55, "shift": 56, "option": 58, "alt": 58,
+    "control": 59, "ctrl": 59, "right_command": 54, "right_shift": 60,
+    "right_option": 61, "right_control": 62,
+}
+_VALID_MODIFIER_WORDS = ("command", "shift", "option", "control")
+
+
+def custom_action_argv(action: dict) -> list[str] | None:
+    """argv for a custom-gesture action dict, or None if invalid (pure).
+
+    {"type": "key", "key": "option"}                        tap a key
+    {"type": "key", "key": "d", "modifiers": ["command"]}   chord
+    {"type": "shell", "argv": ["open", "-a", "Snaply"]}     run a command
+    {"type": "trigger", "name": "mission_control"}          system action
+    """
+    kind = action.get("type")
+    if kind == "shell":
+        argv = action.get("argv")
+        if isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv):
+            return list(argv)
+        return None
+    if kind == "trigger":
+        return trigger_command(str(action.get("name", "")))
+    if kind == "key":
+        from .hotkeys import _KEYCODES as _NAMED_KEYS
+
+        key = str(action.get("key", "")).lower()
+        keycode = _MODIFIER_KEYCODES.get(key, _NAMED_KEYS.get(key))
+        if keycode is None:
+            return None
+        mods = []
+        for m in action.get("modifiers", []) or []:
+            m = str(m).lower()
+            m = {"cmd": "command", "ctrl": "control", "alt": "option"}.get(m, m)
+            if m not in _VALID_MODIFIER_WORDS:
+                return None
+            mods.append(m)
+        return _osascript_keystroke(keycode, *mods)
+    return None
+
+
 def real_cursor_pos() -> tuple[float, float]:
     """Current *actual* cursor position (needs no TCC permission)."""
     loc = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
@@ -227,6 +272,18 @@ class Synth:
             self.right_down = False
         elif name == "scroll" and phase is Phase.MOVE:
             self._scroll(float(payload.get("dy_px", 0.0)))
+        elif phase is Phase.TRIGGER and name.startswith("custom:"):
+            argv = custom_action_argv(payload.get("action") or {})
+            if argv is None:
+                log.warning("custom gesture %s: invalid action %r",
+                            name, payload.get("action"))
+                return
+            subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            # osascript key actions land keystrokes asynchronously; mark the
+            # launch so the keyboard guard attributes them to us.
+            if argv and argv[0] == "osascript":
+                self.last_chord_ts = time.monotonic()
         elif phase is Phase.TRIGGER and trigger_command(name) is not None:
             self._run_trigger(name)
         else:

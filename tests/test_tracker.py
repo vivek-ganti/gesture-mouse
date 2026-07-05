@@ -101,3 +101,50 @@ def test_spaces_module_imports_and_reads_topology():
         space_list, idx = found
         assert 0 <= idx < len(space_list)
         assert "ManagedSpaceID" in space_list[idx]
+
+
+def test_bgra_to_bgr_handles_row_padding():
+    """CoreVideo pads rows to bytes_per_row >= width*4; the converter must
+    slice padding off and drop alpha without channel reordering."""
+    import numpy as np
+    from gesture_mouse.tracker import bgra_to_bgr
+
+    w, h, bpr = 3, 2, 20          # 3*4=12 used, 8 pad bytes per row
+    rows = []
+    val = 0
+    for _ in range(h):
+        row = []
+        for _ in range(w):
+            row += [val, val + 1, val + 2, 255]   # B,G,R,A
+            val += 10
+        row += [0xEE] * (bpr - w * 4)             # padding garbage
+        rows += row
+    out = bgra_to_bgr(bytes(rows), w, h, bpr)
+    assert out.shape == (h, w, 3)
+    assert out[0, 0].tolist() == [0, 1, 2]        # B,G,R preserved in order
+    assert out[1, 2].tolist() == [50, 51, 52]
+    assert 0xEE not in out                        # padding never leaks in
+
+
+def test_custom_action_argv_mapping():
+    """Custom-gesture actions map to runnable argvs; invalid ones -> None."""
+    from gesture_mouse.synth import custom_action_argv
+
+    # Bare modifier tap (the Wispr Flow dictation case).
+    argv = custom_action_argv({"type": "key", "key": "option"})
+    assert argv[0] == "osascript" and argv[-1].endswith("key code 58")
+    # Chord with modifiers (aliases normalized).
+    argv = custom_action_argv({"type": "key", "key": "d", "modifiers": ["cmd"]})
+    assert argv[-1].endswith("key code 2 using {command down}")
+    # Shell.
+    assert custom_action_argv(
+        {"type": "shell", "argv": ["open", "-a", "Snaply"]}
+    ) == ["open", "-a", "Snaply"]
+    # Reuse of a system trigger.
+    assert custom_action_argv({"type": "trigger", "name": "mission_control"})
+    # Invalids.
+    assert custom_action_argv({"type": "key", "key": "nosuchkey"}) is None
+    assert custom_action_argv({"type": "key", "key": "a",
+                               "modifiers": ["hyper"]}) is None
+    assert custom_action_argv({"type": "shell", "argv": []}) is None
+    assert custom_action_argv({"type": "wat"}) is None

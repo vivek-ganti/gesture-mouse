@@ -23,6 +23,11 @@ class CameraConfig:
     mirror: bool = True
     rotate: int = 0             # 0 / 90 / 180 / 270, applied before mirror
     orientation: str = "front"  # "front" | "down" (informational; picks docs/defaults)
+    # "avf" = native AVFoundation capture, device selected by NAME->uniqueID
+    # (label and video can never disagree). "opencv" = cv2.VideoCapture by
+    # index — kept as fallback; its index table cannot be reliably correlated
+    # with device names (order flips between enumerations on real hardware).
+    backend: str = "avf"
 
 
 @dataclass
@@ -167,6 +172,25 @@ class OptionsConfig:
     debug_gestures: bool = False     # print swipe arming/candidate/reject events
 
 
+# Custom gestures: hold a static pose (at a mostly-still hand) for hold_ms ->
+# run an action. Editable/addable in config.json (hot-reloaded). Available
+# poses: "horns" (index + pinky extended, middle + ring curled — the rock
+# sign; thumb ignored). Action types:
+#   {"type": "key", "key": "option"}                     tap a key (incl. bare
+#       modifiers: option/command/shift/control — e.g. Wispr Flow's dictation
+#       toggle), optional "modifiers": ["command", ...] for chords
+#   {"type": "shell", "argv": ["open", "-a", "Snaply"]}  run a command
+#   {"type": "trigger", "name": "mission_control"}       reuse a system action
+DEFAULT_CUSTOM_GESTURES: list[dict] = [
+    {
+        "name": "dictate",
+        "pose": "horns",
+        "hold_ms": 300.0,
+        "cooldown_ms": 1200.0,
+        "action": {"type": "key", "key": "option"},
+    },
+]
+
 # Default bindings match macOS trackpad semantics with a mirrored (selfie)
 # camera: hand moving left on screen = fingers-left on a trackpad = next Space.
 DEFAULT_BINDINGS: dict[str, str] = {
@@ -204,6 +228,9 @@ class Config:
     hotkeys: HotkeyConfig = field(default_factory=HotkeyConfig)
     options: OptionsConfig = field(default_factory=OptionsConfig)
     bindings: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_BINDINGS))
+    custom_gestures: list = field(
+        default_factory=lambda: [dict(g) for g in DEFAULT_CUSTOM_GESTURES]
+    )
 
 
 def _merge(dc: Any, data: dict[str, Any]) -> Any:

@@ -198,6 +198,29 @@ class GestureEngine:
         # detector (so swipe continuity gets the same jitter tolerance).
         self._open_palm_hold = _Debounced(grace)
         self._last_open_palm: bool = False   # for the palm_debug readout
+        # Custom gestures: per-entry debounced pose hold + cooldown. Entries
+        # with an unknown pose/missing action are skipped, surfaced via
+        # custom_skipped so the caller can warn at startup, never silently.
+        self._custom: list[dict] = []
+        self.custom_skipped: list[str] = []
+        for entry in getattr(self.cfg, "custom_gestures", []) or []:
+            if not isinstance(entry, dict):
+                self.custom_skipped.append(str(entry))
+                continue
+            pose = str(entry.get("pose", ""))
+            name = str(entry.get("name", pose or "custom"))
+            if self._custom_pose_test(pose) is None or not entry.get("action"):
+                self.custom_skipped.append(name)
+                continue
+            self._custom.append({
+                "name": name,
+                "pose": pose,
+                "hold_ms": float(entry.get("hold_ms", 300.0)),
+                "cooldown_ms": float(entry.get("cooldown_ms", 1200.0)),
+                "action": dict(entry["action"]),
+                "hold": _Debounced(grace),
+                "block_until": float("-inf"),
+            })
         # Hands lost.
         self._lost_since: float | None = None
         self._reacquire_hold = _Debounced(grace)
@@ -286,6 +309,23 @@ class GestureEngine:
             and self._ext(lm, RING_TIP, RING_PIP, w)
             and self._ext(lm, PINKY_TIP, PINKY_PIP, w)
         )
+
+    def _horns_pose(self, lm: tuple[Point, ...]) -> bool:
+        """Rock sign 🤘: index + pinky extended, middle + ring curled. Thumb
+        ignored (unreliable). Mutually exclusive with pointer (pinky curled
+        there), scroll (middle extended there) and open-palm (middle+ring
+        extended there) — so it can't collide with any built-in gesture."""
+        w = lm[WRIST]
+        return (
+            self._ext(lm, INDEX_TIP, INDEX_PIP, w)
+            and self._ext(lm, PINKY_TIP, PINKY_PIP, w)
+            and not self._ext(lm, MIDDLE_TIP, MIDDLE_PIP, w)
+            and not self._ext(lm, RING_TIP, RING_PIP, w)
+        )
+
+    # Pose name -> test method; extend here when adding new custom poses.
+    def _custom_pose_test(self, pose: str):
+        return {"horns": self._horns_pose}.get(pose)
 
     def _scroll_pose(self, lm: tuple[Point, ...], scale: float) -> bool:
         w = lm[WRIST]
@@ -480,6 +520,37 @@ class GestureEngine:
             rebase = self._tick_palm(cursor, open_palm_debounced)
         elif st is EngineState.HANDS_LOST:
             rebase = self._tick_hands_lost(frame, cursor, ts, valid, intents)
+
+        # Custom gestures: static pose (e.g. horns 🤘) held hold_ms at a
+        # mostly-still hand -> one TRIGGER carrying its action. Evaluated
+        # from CLUTCH_WAIT and POINTER only (like swipes, no cursor clutch
+        # required; never mid pinch/scroll/palm), with the pose debounced
+        # against tracking jitter and a per-gesture cooldown.
+        if (
+            valid
+            and self._custom
+            and self.state in (EngineState.CLUTCH_WAIT, EngineState.POINTER)
+            and self._left_since is None
+            and self._right_since is None
+            and self._arb is None
+            and cursor.speed_px_s < self.cfg.palm.forward_max_speed_px_s
+        ):
+            lm = frame.landmarks
+            assert lm is not None
+            for g in self._custom:
+                test = self._custom_pose_test(g["pose"])
+                since = g["hold"].update(ts, bool(test and test(lm)))
+                if (
+                    since is not None
+                    and ts - since >= g["hold_ms"]
+                    and ts >= g["block_until"]
+                ):
+                    g["block_until"] = ts + g["cooldown_ms"]
+                    g["hold"].reset()
+                    intents.append(Intent(
+                        f"custom:{g['name']}", Phase.TRIGGER,
+                        {"action": g["action"]}, ts,
+                    ))
 
         # Forward PALM-detector intents.
         #

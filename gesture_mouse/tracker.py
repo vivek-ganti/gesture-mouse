@@ -130,11 +130,143 @@ def camera_index(name: str) -> int | None:
     (``cams.index(name)``) rather than calling this function — mixing an
     index from one enumeration with a label from another silently produces
     a real device correctly opened under the WRONG printed/persisted name.
+
+    Used only by the OpenCV FALLBACK backend; the primary AVFoundation
+    backend selects devices by uniqueID and needs no index mapping at all.
     """
     for i, cam in enumerate(list_cameras()):
         if cam == name:
             return i
     return None
+
+
+# --------------------------- AVFoundation capture -----------------------------
+#
+# The primary capture backend. cv2.VideoCapture on macOS can only address
+# cameras BY INDEX, and its internal index table comes from its own
+# AVFoundation enumeration — which does not reliably match ours (the order of
+# two devices flipped between two calls microseconds apart on real hardware).
+# That made "which physical camera does this index/name refer to" ultimately
+# unknowable through cv2, producing the recurring the-video-is-FaceTime-but-
+# the-label-says-Iriun bug. Capturing natively through AVFoundation selects
+# the device object itself (name -> uniqueID -> AVCaptureDevice), so the
+# label and the video CANNOT disagree. cv2 capture remains as the fallback
+# backend (config: camera.backend = "avf" | "opencv").
+
+_BGRA_FOURCC = 0x42475241  # kCVPixelFormatType_32BGRA
+
+
+def bgra_to_bgr(buf: bytes, width: int, height: int, bytes_per_row: int) -> np.ndarray:
+    """Copy-and-convert a padded BGRA buffer to a (h, w, 3) BGR array.
+
+    Pure numpy (testable without a camera): CoreVideo rows are padded to
+    ``bytes_per_row`` >= width*4, so slice the padding off before dropping
+    the alpha channel. BGRA byte order means BGR is simply the first three
+    channels — no channel swap needed for cv2/MediaPipe(BGR->RGB later).
+    """
+    arr = np.frombuffer(buf, dtype=np.uint8)
+    arr = arr.reshape(height, bytes_per_row)[:, : width * 4]
+    return arr.reshape(height, width, 4)[:, :, :3].copy()
+
+
+class _AVFCapture:
+    """Minimal AVCaptureSession wrapper: latest-frame mailbox semantics.
+
+    The session runs on its own dispatch queue; the delegate overwrites a
+    single latest-frame slot (lock-guarded). ``read_bgr`` waits (bounded)
+    for a frame newer than the last one it handed out — the 30Hz hot loop
+    consumes at its own pace and late frames are discarded, never queued.
+    """
+
+    def __init__(self, device: Any) -> None:
+        import AVFoundation as AVF
+        import CoreMedia  # noqa: F401  (loads CMSampleBuffer bridges)
+        import dispatch
+        import objc
+        from Foundation import NSObject
+
+        self._device = device
+        self._lock = __import__("threading").Lock()
+        self._latest: tuple[bytes, int, int, int] | None = None
+        self._seq = 0
+        self._consumed_seq = 0
+
+        outer = self
+
+        class _Delegate(NSObject):
+            def captureOutput_didOutputSampleBuffer_fromConnection_(
+                self, _output, sample_buffer, _connection
+            ):  # noqa: N802 - ObjC selector
+                try:
+                    import CoreMedia as CM
+                    from Quartz import CoreVideo as CV
+
+                    img = CM.CMSampleBufferGetImageBuffer(sample_buffer)
+                    if img is None:
+                        return
+                    CV.CVPixelBufferLockBaseAddress(img, 1)  # read-only
+                    try:
+                        w = CV.CVPixelBufferGetWidth(img)
+                        h = CV.CVPixelBufferGetHeight(img)
+                        bpr = CV.CVPixelBufferGetBytesPerRow(img)
+                        base = CV.CVPixelBufferGetBaseAddress(img)
+                        # objc.varlist -> bytes COPY (the buffer dies at unlock).
+                        data = base.as_buffer(bpr * h)[:]
+                    finally:
+                        CV.CVPixelBufferUnlockBaseAddress(img, 1)
+                    with outer._lock:
+                        outer._latest = (bytes(data), int(w), int(h), int(bpr))
+                        outer._seq += 1
+                except Exception:  # never let an ObjC callback explode
+                    pass
+
+        self._delegate = _Delegate.alloc().init()
+        self._queue = dispatch.dispatch_queue_create(b"gesture-mouse.capture", None)
+
+        session = AVF.AVCaptureSession.alloc().init()
+        session.beginConfiguration()
+        if session.canSetSessionPreset_(AVF.AVCaptureSessionPreset640x480):
+            session.setSessionPreset_(AVF.AVCaptureSessionPreset640x480)
+        dev_input, err = AVF.AVCaptureDeviceInput.deviceInputWithDevice_error_(
+            device, None
+        )
+        if dev_input is None:
+            raise RuntimeError(f"AVCaptureDeviceInput failed: {err}")
+        if not session.canAddInput_(dev_input):
+            raise RuntimeError("AVCaptureSession rejected the device input")
+        session.addInput_(dev_input)
+
+        from Quartz.CoreVideo import kCVPixelBufferPixelFormatTypeKey
+
+        output = AVF.AVCaptureVideoDataOutput.alloc().init()
+        output.setVideoSettings_({kCVPixelBufferPixelFormatTypeKey: _BGRA_FOURCC})
+        output.setAlwaysDiscardsLateVideoFrames_(True)
+        output.setSampleBufferDelegate_queue_(self._delegate, self._queue)
+        if not session.canAddOutput_(output):
+            raise RuntimeError("AVCaptureSession rejected the video output")
+        session.addOutput_(output)
+        session.commitConfiguration()
+        session.startRunning()
+        self._session = session
+
+    def read_bgr(self, timeout_s: float = 1.0) -> np.ndarray | None:
+        """Newest frame not yet handed out, or None on timeout."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._latest is not None and self._seq != self._consumed_seq:
+                    self._consumed_seq = self._seq
+                    buf, w, h, bpr = self._latest
+                    return bgra_to_bgr(buf, w, h, bpr)
+            time.sleep(0.004)
+        return None
+
+    def release(self) -> None:
+        try:
+            self._session.stopRunning()
+        except Exception:
+            pass
+        self._latest = None
 
 
 def bench_cameras(n_frames: int = 10, width: int = 640, height: int = 480,
@@ -203,7 +335,8 @@ class CameraTracker:
     def __init__(self, cfg: Config, model_path: str = "hand_landmarker.task") -> None:
         self._cfg = cfg
         self._model_path = self._resolve_model_path(model_path)
-        self._cap: cv2.VideoCapture | None = None
+        self._cap: cv2.VideoCapture | None = None      # opencv fallback backend
+        self._avf: _AVFCapture | None = None           # primary backend
         self._landmarker: Any = None
         self._source: str = cfg.camera.name or "camera"
         # Rotated+mirrored BGR image of the last successful grab (additive to
@@ -278,10 +411,90 @@ class CameraTracker:
         return (sum(times) / len(times) * 1000.0,
                 sum(brights) / len(brights))
 
+    @staticmethod
+    def _probe_avf(cap: "_AVFCapture") -> tuple[float, float]:
+        """(avg read ms, avg brightness) after the exposure ramp — same dead-
+        virtual-camera detection as the cv2 probe (a phone-cam app with no
+        phone serves slow/black frames through AVFoundation too)."""
+        ramp_until = time.monotonic() + 0.8
+        while time.monotonic() < ramp_until:
+            cap.read_bgr(timeout_s=0.25)
+        times: list[float] = []
+        brights: list[float] = []
+        for _ in range(5):
+            t0 = time.monotonic()
+            bgr = cap.read_bgr(timeout_s=1.2)
+            times.append(time.monotonic() - t0)
+            if bgr is not None:
+                brights.append(float(bgr.mean()))
+        if not brights:
+            return float("inf"), -1.0
+        return (sum(times) / len(times) * 1000.0, sum(brights) / len(brights))
+
+    def _open_avf(self) -> bool:
+        """Primary backend: AVFoundation-native capture, device selected by
+        NAME -> the device OBJECT itself — the label and the video cannot
+        disagree (the cv2 index table made that correlation unknowable).
+        Candidates: configured name first, then built-in, then the rest;
+        each is probed and dead virtual feeds are skipped. Returns False if
+        nothing opens (caller falls back to the cv2 backend)."""
+        devices = _avf_devices()
+        if not devices:
+            return False
+        name = self._cfg.camera.name
+        ordered: list[Any] = []
+        for want_first in (
+            lambda d: name and str(d.localizedName()) == name,
+            lambda d: "facetime" in str(d.localizedName()).lower()
+            or "built-in" in str(d.localizedName()).lower(),
+            lambda d: True,
+        ):
+            for d in devices:
+                if d not in ordered and want_first(d):
+                    ordered.append(d)
+
+        dead_fallback: tuple[_AVFCapture, str] | None = None
+        for device in ordered:
+            label = str(device.localizedName())
+            try:
+                cap = _AVFCapture(device)
+            except Exception as exc:
+                print(f"avf {label!r}: failed to open ({exc}); trying next")
+                continue
+            read_ms, bright = self._probe_avf(cap)
+            print(f"avf {label!r}: probe read {read_ms:.0f}ms "
+                  f"brightness {bright:.1f}")
+            if read_ms < 500.0 and bright > 0.5:
+                if dead_fallback is not None:
+                    dead_fallback[0].release()
+                self._avf = cap
+                self._source = label
+                return True
+            if dead_fallback is None:
+                dead_fallback = (cap, label)
+                print("  looks dead (slow or black) — trying next camera")
+            else:
+                cap.release()
+        if dead_fallback is not None:
+            self._avf, self._source = dead_fallback
+            print(f"  WARNING: no camera produced a live image; using "
+                  f"{self._source!r} anyway (dark room? pick another with 1-9).")
+            return True
+        return False
+
     def open(self) -> None:
         # Landmarker first: a model-load failure must not leave the camera
         # acquired while the app drops back to IDLE (IDLE = zero camera use).
         self._landmarker = self._make_landmarker()
+        if self._cfg.camera.backend != "opencv":
+            try:
+                if self._open_avf():
+                    return
+            except Exception as exc:
+                print(f"avf backend failed ({exc}); falling back to opencv")
+        self._open_opencv()
+
+    def _open_opencv(self) -> None:
         order, cams = self._candidate_order()
         cfg = self._cfg.camera
         fallback: tuple[cv2.VideoCapture, int, str] | None = None
@@ -338,36 +551,40 @@ class CameraTracker:
         return self._source
 
     def switch_camera(self, index: int) -> str | None:
-        """Hot-switch to camera ``index`` (from ``list_cameras()``): the
-        landmarker and its timestamp clock are untouched, only the capture
-        device changes. Returns the new camera's name on success, None on
-        failure — in which case the PREVIOUS camera is left open and
-        streaming, so a bad switch never drops the feed.
+        """Hot-switch to camera ``index`` (into ``list_cameras()`` NAMES —
+        the name is resolved back to the device object, never to a cv2
+        index): the landmarker and its timestamp clock are untouched, only
+        the capture device changes. Returns the new camera's name on
+        success, None on failure — in which case the PREVIOUS camera is
+        left open and streaming, so a bad switch never drops the feed.
 
         Requires ``open()`` to have been called (there must be a current
         capture to fall back to); IDLE has no camera to switch.
         """
-        if self._cap is None:
+        if self._cap is None and self._avf is None:
             return None
-        cams = list_cameras()
-        if index < 0 or index >= len(cams):
+        devices = _avf_devices()
+        if index < 0 or index >= len(devices):
             return None
-        label = cams[index]
-        cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
-        if not cap.isOpened():
-            cap.release()
+        device = devices[index]
+        label = str(device.localizedName())
+        if label == self._source:
+            return label  # already on it
+        try:
+            cap = _AVFCapture(device)
+        except Exception:
             return None
-        cam = self._cfg.camera
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam.height)
-        cap.set(cv2.CAP_PROP_FPS, cam.fps)
-        read_ms, bright = self._probe_cap(cap)
+        read_ms, bright = self._probe_avf(cap)
         if read_ms >= 500.0 or bright < 0.5:
             cap.release()  # looks dead: keep the camera that was working
             return None
-        old_cap, self._cap = self._cap, cap
+        old_avf, self._avf = self._avf, cap
+        old_cap, self._cap = self._cap, None
         self._source = label
-        old_cap.release()
+        if old_avf is not None:
+            old_avf.release()
+        if old_cap is not None:
+            old_cap.release()
         return label
 
     def _make_landmarker(self) -> Any:
@@ -398,11 +615,16 @@ class CameraTracker:
 
     def read(self) -> LandmarkFrame | None:
         """One frame through the full convention pipeline; None = grab failed."""
-        if self._cap is None or self._landmarker is None:
+        if (self._cap is None and self._avf is None) or self._landmarker is None:
             raise RuntimeError("CameraTracker.read() before open()")
-        ok, bgr = self._cap.read()
-        if not ok or bgr is None:
-            return None
+        if self._avf is not None:
+            bgr = self._avf.read_bgr(timeout_s=1.0)
+            if bgr is None:
+                return None
+        else:
+            ok, bgr = self._cap.read()
+            if not ok or bgr is None:
+                return None
         rotate = self._cfg.camera.rotate % 360
         if rotate in _ROTATE_CODES:  # rotate BEFORE mirror (config contract)
             bgr = cv2.rotate(bgr, _ROTATE_CODES[rotate])
@@ -461,6 +683,11 @@ class CameraTracker:
         """Release camera and landmarker fully. The ts clock is NOT reset —
         a later open() recreates the landmarker against the same clock."""
         self.last_bgr = None  # never keep a camera image alive in IDLE
+        if self._avf is not None:
+            try:
+                self._avf.release()
+            finally:
+                self._avf = None
         if self._cap is not None:
             try:
                 self._cap.release()

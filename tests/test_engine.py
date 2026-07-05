@@ -453,3 +453,55 @@ def test_pinch_spread_bound_intent_still_gated_by_cursor_speed_from_pointer():
     fast_hits = [i for i in named(intents, "launchpad") if i.ts_ms >= t_fast_start]
     assert fast_hits == [], f"launchpad forwarded during fast motion: {fast_hits}"
     assert eng.state is EngineState.POINTER
+
+
+def test_horns_pose_fires_custom_gesture_with_action_payload():
+    """Devil-horns 🤘 held ~300ms at a still hand fires the configured custom
+    gesture exactly once, carrying its action dict for synth to execute —
+    works from CLUTCH_WAIT too (no cursor clutch needed, like swipes)."""
+    cfg = Config()
+    assert cfg.custom_gestures, "default config ships the dictate example"
+    s = Seq(pose="horns")
+    s.hold("horns", 600)                 # rest + hold_ms with margin
+    intents, _, eng = run(s.frames, cfg=cfg)
+
+    fired = named(intents, "custom:dictate")
+    assert len(fired) == 1
+    assert fired[0].phase is Phase.TRIGGER
+    assert fired[0].payload["action"] == {"type": "key", "key": "option"}
+    assert eng.state is EngineState.CLUTCH_WAIT   # horns is not the clutch pose
+
+
+def test_custom_gesture_cooldown_blocks_continuous_hold():
+    cfg = Config()
+    s = Seq(pose="horns")
+    s.hold("horns", 1100)                # held straight through the cooldown
+    intents, _, _ = run(s.frames, cfg=cfg)
+    assert len(named(intents, "custom:dictate")) == 1
+
+    # After cooldown + re-hold, it fires again.
+    s2 = Seq(pose="horns", start_ms=s.ts + 1300.0)
+    s2.hold("horns", 600)
+    # continue through the SAME engine by replaying both sequences
+    intents_all, _, _ = run(s.frames + s2.frames, cfg=cfg)
+    assert len(named(intents_all, "custom:dictate")) == 2
+
+
+def test_custom_gesture_not_fired_during_pinch():
+    cfg = Config()
+    s = Seq()
+    s.hold("pointer", 400)
+    s.pinch_to(0.20, 100)                # left pinch in flight
+    s.hold(ms=600)
+    intents, _, _ = run(s.frames, cfg=cfg)
+    assert named(intents, "custom:dictate") == []
+
+
+def test_unknown_custom_pose_skipped_and_surfaced():
+    cfg = Config()
+    cfg.custom_gestures = [{"name": "bad", "pose": "nosuch",
+                            "action": {"type": "key", "key": "option"}}]
+    from gesture_mouse.filters import CursorPipeline
+    pipe = CursorPipeline(cfg, *SCREEN)
+    eng = GestureEngine(cfg, pipe.pinch)
+    assert eng.custom_skipped == ["bad"]

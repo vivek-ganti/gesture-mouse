@@ -147,10 +147,27 @@ the detector on entry. pinch_in/spread_out keep their PALM-or-slow-POINTER
 forwarding gate. The anchor-teleport -> HANDS_LOST guard is skipped in PALM
 (a real flick moves the anchor >25% of the frame in one frame).
 
+### Custom gestures (engine + synth, added with the horns/dictate feature)
+
+- Config: `Config.custom_gestures` = list of dicts {name, pose, hold_ms,
+  cooldown_ms, action}. Engine validates at construction; invalid entries go
+  to `engine.custom_skipped` (caller prints a startup warning).
+- Engine: pose registry `_custom_pose_test(pose)` ("horns" = index+pinky
+  extended, middle+ring curled, thumb ignored — collision-free with all
+  built-in poses). Held (debounced) hold_ms with a mostly-still cursor from
+  CLUTCH_WAIT/POINTER, no pinch in flight -> Intent("custom:<name>", TRIGGER,
+  {"action": <dict>}) + per-gesture cooldown.
+- Synth: `custom_action_argv(action) -> argv | None` (pure, tested): key taps
+  (incl. bare modifiers) via osascript System Events, shell argv, or reuse of
+  a system trigger_command. Fire-and-forget Popen.
+
 ## tracker.py
 
 ```python
-def list_cameras() -> list[str]          # AVFoundation localizedName order == cv2 index order
+# Capture backend: camera.backend "avf" (default) = native AVCaptureSession,
+# device selected by NAME -> uniqueID (label and video cannot disagree);
+# "opencv" = cv2.VideoCapture fallback (index-based; order unreliable).
+def list_cameras() -> list[str]          # AVFoundation localizedName order
 def camera_index(name: str) -> int | None
 
 class CameraTracker:

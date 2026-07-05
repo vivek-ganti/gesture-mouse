@@ -157,6 +157,9 @@ class App:
         self.palm = PalmDetector(self.cfg.palm, self.cfg.bindings,
                                  debug=self.cfg.options.debug_gestures)
         self.engine = GestureEngine(self.cfg, self.pipeline.pinch, self.palm)
+        for skipped in self.engine.custom_skipped:
+            print(f"[config] custom gesture {skipped!r} skipped "
+                  f"(unknown pose or missing action) — see README")
         self.synth: Synth | None = Synth() if self.post_events else None
         # Guards exist whenever we post real input — including --replay-post,
         # where physical input must still be able to stop the replay.
@@ -311,6 +314,8 @@ class App:
         elif ch == "b" and self.preview is not None:
             self.preview.show_box = not self.preview.show_box
             print(f"[tune] control-box overlay {'on' if self.preview.show_box else 'off'}")
+        elif ch in ("h", "H", "?") and self.preview is not None:
+            self.preview.show_help = not self.preview.show_help
         elif ch == "p":
             opts = self.cfg.options
             opts.privacy_preview = not opts.privacy_preview

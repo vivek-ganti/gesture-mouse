@@ -4,5 +4,6 @@ pyobjc-framework-Quartz
 pyobjc-framework-Cocoa
 pyobjc-framework-ApplicationServices
 pyobjc-framework-AVFoundation
+pyobjc-framework-libdispatch
 numpy
 pytest

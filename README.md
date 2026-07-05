@@ -58,12 +58,14 @@ the panic key can never be silently dead.
 ./gesture-mouse --camera "FaceTime HD Camera"
 ```
 
-Names are a *preference*, not gospel: macOS enumeration order is unstable and
-can disagree with OpenCV's index table (virtual phone-cam apps like Iriun make
-this worse — with no phone connected they serve ~1 fps black frames). At
-startup every candidate camera is **probed** (read speed + real image content)
-and the first live one wins; the chosen device is printed. Per-camera
-`mirror` / `rotate` / `orientation` live in `config.json`.
+Capture is **native AVFoundation** (`camera.backend: "avf"`, the default):
+the device is selected by its name → unique ID, so the printed/persisted name
+and the actual video can never disagree (the old OpenCV index-based capture
+made that correlation unreliable — device order shuffles between
+enumerations; it remains available as `"backend": "opencv"`). At startup
+every candidate camera is **probed** (read speed + real image content) and
+dead virtual feeds (phone-cam apps with no phone connected) are skipped.
+Per-camera `mirror` / `rotate` / `orientation` live in `config.json`.
 
 Handedness labels also depend on the camera's mirror convention, so
 `"hand": "auto"` (default) tracks whichever hand appears; pin `"right"` /
@@ -106,7 +108,7 @@ Hotkeys (global, configurable in `config.json`): **⌃⌥G** toggle IDLE⇄ACTIV
 
 Live-tune keys (preview window focused): `[` / `]` mincutoff down/up ·
 `;` / `'` beta down/up · `b` control-box overlay · `p` privacy mode ·
-**`1`-`9` switch camera** · `q` quit. PerfTimer prints per-stage p50/p95 every 5 s.
+**`1`-`9` switch camera** · **`h` help/guide overlay** · `q` quit. PerfTimer prints per-stage p50/p95 every 5 s.
 
 The corner dot shows state everywhere (incl. fullscreen): gray idle · pulsing
 warmup · white clutch-wait · green pointer · blue pinched · purple scroll ·
@@ -171,6 +173,36 @@ plus dropout histograms for a recorded clip.
 Bindings for the six system gestures are remappable in `config.json`
 (`bindings`: swipe_left/right/up/down, pinch_in, spread_out → any of
 space_prev, space_next, mission_control, app_expose, launchpad, show_desktop).
+
+## Custom gestures (map a pose to any shortcut)
+
+`config.json → custom_gestures` is a list you can edit, extend, or empty —
+hot-reloaded while running. Each entry: hold the pose (with a mostly-still
+hand) for `hold_ms` and the action fires, then a `cooldown_ms` refractory.
+
+```json
+"custom_gestures": [
+  { "name": "dictate", "pose": "horns", "hold_ms": 300,
+    "action": { "type": "key", "key": "option" } },
+  { "name": "snaply", "pose": "horns", "hold_ms": 300,
+    "action": { "type": "shell", "argv": ["open", "-a", "Snaply"] } }
+]
+```
+
+Poses available today: `"horns"` 🤘 (index + pinky extended, middle + ring
+curled; thumb ignored) — chosen because it cannot collide with any built-in
+gesture. Action types:
+
+| type | fields | does |
+|---|---|---|
+| `key` | `key`, optional `modifiers` | taps a key — bare modifiers work (`"option"` = Wispr Flow's dictation toggle), or chords like `{"key": "d", "modifiers": ["command"]}` |
+| `shell` | `argv` | runs a command, e.g. `["open", "-a", "Snaply"]` |
+| `trigger` | `name` | reuses a system action (`mission_control`, `show_desktop`, ...) |
+
+The ships-by-default example is exactly the dictation case: hold the horns
+sign ~300 ms → Option is tapped → Wispr Flow starts listening. Entries with
+an unknown pose are skipped with a startup warning, never silently. The
+in-app guide (`h`) always lists whatever custom gestures your config defines.
 
 ## Tuning (One Euro, Casiez procedure)
 

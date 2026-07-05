@@ -58,6 +58,8 @@ _POSES = {
               "pinky": "curl"}, (15.0, 45.0)),
     "relaxed": ({"index": "half", "middle": "half", "ring": "half",
                  "pinky": "half"}, (-20.0, 30.0)),
+    "horns": ({"index": "ext", "middle": "curl", "ring": "curl",
+               "pinky": "ext"}, (-20.0, 30.0)),
 }
 
 
