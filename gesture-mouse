@@ -1,8 +1,37 @@
 #!/usr/bin/env bash
-# Convenience launcher: run from the repo root without activating the venv.
+# One-command launcher: on first run, creates the venv and installs
+# dependencies automatically (~1-2 minutes, once); every run after that just
+# starts the app. Works from any cwd, e.g. `~/gesture-mouse/gesture-mouse`.
 #   ./gesture-mouse --start-active
-# Forwards every argument straight to `python -m gesture_mouse`.
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
+
+MARKER="$DIR/.venv/.deps-installed"
+if [ ! -f "$MARKER" ]; then
+  echo "gesture-mouse: first run — setting up the Python environment (~1-2 min, once only)"
+
+  PY=""
+  for candidate in python3.12 python3; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      version="$("$candidate" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || true)"
+      if [ "$version" = "3.12" ]; then
+        PY="$candidate"
+        break
+      fi
+    fi
+  done
+  if [ -z "$PY" ]; then
+    echo "gesture-mouse: Python 3.12 is required (MediaPipe's macOS wheel needs it exactly)." >&2
+    echo "  Install it with: brew install python@3.12" >&2
+    exit 1
+  fi
+
+  "$PY" -m venv "$DIR/.venv"
+  "$DIR/.venv/bin/pip" install --quiet --upgrade pip
+  "$DIR/.venv/bin/pip" install --quiet -r "$DIR/requirements.txt"
+  touch "$MARKER"
+  echo "gesture-mouse: setup complete"
+fi
+
 exec "$DIR/.venv/bin/python" -m gesture_mouse "$@"

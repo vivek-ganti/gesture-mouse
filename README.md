@@ -6,13 +6,17 @@ gestures (Spaces, Mission Control, App Exposé, Launchpad, Show Desktop) —
 hands in the air, no hardware. MediaPipe hand tracking → pure-logic gesture
 engine → raw Quartz CGEvents. macOS 15+, Apple Silicon, Python 3.12.
 
-## Quick start (60 seconds)
+## Quick start
 
 ```bash
 git clone https://github.com/vivek-ganti/gesture-mouse.git && cd gesture-mouse
-python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ./gesture-mouse --start-active
 ```
+
+That's the whole install. The first run takes ~1-2 minutes to create a venv
+and install dependencies automatically (needs Python 3.12 on your `PATH` —
+`brew install python@3.12` if you don't have it; the script tells you if it's
+missing); every run after that starts in under a second.
 
 Grant the two permission prompts, then: **hold your index finger up (other
 fingers curled) for ~150 ms** — the corner dot turns green and the cursor is
@@ -21,8 +25,12 @@ Type or grab the real mouse any time — gestures suspend instantly.
 
 ## Setup
 
+Nothing manual — `./gesture-mouse` bootstraps itself on first run (see Quick
+start above). If you'd rather set it up by hand (or need a non-default Python
+path):
+
 ```bash
-python3.12 -m venv .venv          # Python 3.12 (MediaPipe wheel requirement)
+python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 # hand_landmarker.task (MediaPipe model) already sits in the repo root.
 ```
@@ -75,9 +83,10 @@ Handedness labels also depend on the camera's mirror convention, so
 ./gesture-mouse --start-active   # camera on immediately
 ```
 
-`./gesture-mouse` is a launcher script — it finds `.venv` for you (works from
-any directory, e.g. `~/Documents/vivek-code/gesture-mouse/gesture-mouse`), so
-you never have to type `.venv/bin/python -m gesture_mouse` or activate the
+`./gesture-mouse` is a launcher script — it creates `.venv` and installs
+dependencies the first time it's run, and just finds them every time after
+(works from any directory, e.g. `~/Documents/vivek-code/gesture-mouse/gesture-mouse`),
+so you never have to type `.venv/bin/python -m gesture_mouse` or activate the
 venv yourself. It forwards every flag, e.g. `./gesture-mouse --list-cameras`.
 (`.venv/bin/python -m gesture_mouse ...` still works identically if you
 prefer it or the venv is already active in your shell.)
