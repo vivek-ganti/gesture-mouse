@@ -44,7 +44,7 @@ from .palm import PalmDetector
 from .preview import Preview
 from .synth import Synth, real_cursor_pos, screen_size
 from .tracker import CameraTracker, Recorder, ReplayTracker, bench_cameras, list_cameras
-from .types import EngineState, Intent, LandmarkFrame, SessionState, StateSnapshot
+from .types import EngineState, Intent, LandmarkFrame, Phase, SessionState, StateSnapshot
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -530,6 +530,13 @@ class App:
                 self._suspend(reason)
             elif self.synth is not None:
                 for intent in out.intents:
+                    if intent.phase is Phase.TRIGGER:
+                        # System gestures are rare enough per session that
+                        # printing every one is never spam, and it's the only
+                        # way to tell "the engine never recognized the
+                        # gesture" apart from "it fired but macOS/the app in
+                        # front didn't react" without opening the preview.
+                        print(f"[gesture] {intent.name} (posting now)")
                     self.synth.execute(intent)
         elif self.session is SessionState.SUSPENDED:
             # Engine left its reacquire-clutch: the user held the pointer
