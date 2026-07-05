@@ -100,20 +100,37 @@ def _avf_devices() -> list[Any]:
 
 
 def list_cameras() -> list[str]:
-    """localizedName of every video capture device, in stable device order.
+    """localizedName of every video capture device, in AVFoundation's current
+    device order — position i is the index to pass to
+    cv2.VideoCapture(i, cv2.CAP_AVFOUNDATION), on the (unenforced) assumption
+    that OpenCV's AVFoundation backend built its index table from the same
+    device order.
 
-    OpenCV's AVFoundation backend builds its index→device table from the same
-    AVFoundation device enumeration, so position i here is the index to pass
-    to cv2.VideoCapture(i, cv2.CAP_AVFOUNDATION). This is an empirically
-    stable convention, not an API guarantee — CameraTracker.open() therefore
-    falls back to index 0 with a warning when a configured name is missing,
-    and the preview window makes a wrong-camera mapping immediately obvious.
+    That assumption is NOT reliable, confirmed in the wild: two calls to this
+    function microseconds apart can return the same two devices in a
+    different order. Every caller that resolves an index from a name (or a
+    position) MUST reuse the exact same list for everything downstream of
+    that resolution — a fresh second call, even moments later, can silently
+    disagree with the first. See camera_index()'s docstring for the specific
+    bug this caused (an index resolved from one call, a label taken from
+    another: the video was the right device, the printed/persisted name
+    wasn't).
     """
     return [str(d.localizedName()) for d in _avf_devices()]
 
 
 def camera_index(name: str) -> int | None:
-    """Index of the named camera for cv2.VideoCapture, or None if not found."""
+    """Index of the named camera for cv2.VideoCapture, or None if not found.
+
+    Convenience one-off wrapper — it performs ITS OWN ``list_cameras()``
+    call. AVFoundation's enumeration order is not perfectly repeatable
+    call-to-call (confirmed in the wild: two calls microseconds apart can
+    swap the order of two devices), so any caller that has already fetched
+    its own ``cams`` list must resolve the index from THAT SAME list
+    (``cams.index(name)``) rather than calling this function — mixing an
+    index from one enumeration with a label from another silently produces
+    a real device correctly opened under the WRONG printed/persisted name.
+    """
     for i, cam in enumerate(list_cameras()):
         if cam == name:
             return i
@@ -205,16 +222,28 @@ class CameraTracker:
 
     def _candidate_order(self) -> tuple[list[int], list[str]]:
         """Camera indexes to try, configured name's index first. The
-        AVFoundation enumeration order is NOT stable across runs and may not
-        match OpenCV's internal index table, so the name is a *preference*,
-        never trusted — every candidate is probed before being accepted."""
+        AVFoundation enumeration order is NOT stable across runs (or even
+        two calls microseconds apart) and may not match OpenCV's internal
+        index table, so the name is a *preference*, never trusted — every
+        candidate is probed before being accepted.
+
+        list_cameras() is called EXACTLY ONCE here and ``cams`` is the only
+        source of truth for the rest of this method (and for the label
+        ``open()`` ultimately reports) — resolving the preferred index via a
+        SEPARATE list_cameras() call (e.g. the standalone camera_index()
+        helper) was the actual bug behind a real device opening correctly
+        while being labeled with the other camera's name: two enumerations
+        microseconds apart returned devices in a different order, so an
+        index computed from one call was applied to labels from the other.
+        """
         cams = list_cameras()
         order = list(range(max(len(cams), 1)))
         name = self._cfg.camera.name
         preferred: int | None = None
         if name:
-            preferred = camera_index(name)
-            if preferred is None:
+            try:
+                preferred = cams.index(name)
+            except ValueError:
                 warnings.warn(
                     f"camera {name!r} not found (available: {cams!r}); probing all"
                 )
