@@ -106,9 +106,16 @@ prefer it or the venv is already active in your shell.)
 Hotkeys (global, configurable in `config.json`): **⌃⌥G** toggle IDLE⇄ACTIVE ·
 **⌃⌥Esc** panic → IDLE, releasing all buttons.
 
-Live-tune keys (preview window focused): `[` / `]` mincutoff down/up ·
-`;` / `'` beta down/up · `b` control-box overlay · `p` privacy mode ·
-**`1`-`9` switch camera** · **`h` help/guide overlay** · `q` quit. PerfTimer prints per-stage p50/p95 every 5 s.
+Live-tune keys (preview window focused): `[` / `]` cursor mincutoff down/up ·
+`;` / `'` cursor beta down/up · `-` / `=` gesture forgiveness down/up ·
+`,` / `.` gesture smoothing down/up · `b` control-box overlay · `p` privacy
+mode · **`1`-`9` switch camera** · **`h` help/guide overlay** · `q` quit.
+PerfTimer prints per-stage p50/p95 every 5 s.
+
+The preview window always renders at a fixed size (`config.json → preview`,
+default 960x540) regardless of the camera's actual capture resolution —
+cameras don't reliably honor a requested resolution, so the window would
+otherwise resize or look broken depending on what a given camera delivers.
 
 The corner dot shows state everywhere (incl. fullscreen): gray idle · pulsing
 warmup · white clutch-wait · green pointer · blue pinched · purple scroll ·
@@ -228,19 +235,30 @@ Offline, with a recording:
 sweeping noiseless synthetic fixtures. Everything hot-reloads: edit
 `config.json` while running and the new values apply within a second.
 
-### If a pose-based gesture (swipes, Launchpad, Show Desktop) won't trigger
+### If a gesture feels unreliable (misses often, needs an exaggerated pose)
 
-Requiring several fingers to agree at once is far more sensitive to a single
-noisy tracking frame than the one-finger pointer pose. Every pose hold
-(clutch engage, scroll entry, the four-finger open-palm pose) tolerates up to
-`pose_jitter_grace_ms` (default 120 ms, `config.json` top level) of dropped
-detection without resetting — if gestures still feel unreliable in your
-lighting/camera, raise it a bit. `palm.forward_max_speed_px_s` (default 300)
-caps how fast the cursor can be moving for a five-finger pinch/spread to
-still register while the engine hasn't (yet) recognized the four-finger open
-pose; lower it if accidental Launchpad/Show Desktop triggers happen during
-normal cursor use, raise it if a deliberate gesture with a drifting hand gets
-dropped.
+Every finger's extended/curled state comes from the angle at its middle
+(PIP) knuckle — 180° is perfectly straight, 0° is folded flat — smoothed
+first (One Euro, same technique as cursor smoothing) so per-frame camera
+jitter can't flip the reading, then latched with two thresholds instead of
+one (`config.json → pose`: `extend_angle_deg` default 160, `curl_angle_deg`
+default 130) so a finger sitting between the two just keeps whatever state
+it was already in, rather than flickering. Live-tune while testing:
+
+- `-` / `=` make gesture recognition more/less forgiving (widens/narrows how
+  straight a finger must be to read as extended).
+- `,` / `.` make landmark smoothing lighter/heavier (heavier kills more
+  jitter but adds a touch of lag before a gesture registers).
+
+If gestures still feel unreliable in your lighting/camera after tuning
+those, `pose_jitter_grace_ms` (default 120 ms, `config.json` top level)
+controls how long a pose hold (clutch engage, scroll entry, the four-finger
+open-palm pose) tolerates dropped detection before resetting — raise it a
+bit. `palm.forward_max_speed_px_s` (default 300) caps how fast the cursor
+can be moving for a five-finger pinch/spread to still register while the
+engine hasn't (yet) recognized the four-finger open pose; lower it if
+accidental Launchpad/Show Desktop triggers happen during normal cursor use,
+raise it if a deliberate gesture with a drifting hand gets dropped.
 
 ## Safety model
 

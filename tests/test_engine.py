@@ -7,12 +7,17 @@ asserts the exact Intent name/phase sequence.
 """
 from __future__ import annotations
 
+import random
+
+import pytest
+
 from gesture_mouse.config import Config
-from gesture_mouse.engine import GestureEngine
-from gesture_mouse.filters import CursorPipeline
-from gesture_mouse.types import EngineState, Phase
+from gesture_mouse.engine import GestureEngine, _FingerState, _pip_angle_deg
+from gesture_mouse.filters import CursorPipeline, LandmarkSmoother
+from gesture_mouse.types import INDEX_MCP, INDEX_PIP, INDEX_TIP, EngineState, Phase, Point
 
 from helpers import STEP_MS, Seq
+from pose_fixtures import make_bent_frame
 
 SCREEN = (1280.0, 800.0)
 
@@ -505,3 +510,143 @@ def test_unknown_custom_pose_skipped_and_surfaced():
     pipe = CursorPipeline(cfg, *SCREEN)
     eng = GestureEngine(cfg, pipe.pinch)
     assert eng.custom_skipped == ["bad"]
+
+
+# -- angle-based pose classification (plan doc: gesture reliability) --------
+#
+# _pip_angle_deg/_FingerState replaced a single hard-cutoff ratio test with
+# an angle metric (180 = straight/extended, 0 = folded/curled) plus a real
+# hysteresis band, mirroring the engage/release pattern already proven by
+# pinch detection. helpers.py's Seq/make_frame fixtures keep every joint
+# collinear (see pose_fixtures.py's module docstring for why), so the tests
+# below either check the pure geometry directly or use pose_fixtures.py's
+# genuinely-bent fixtures.
+
+
+class TestPipAngle:
+    def test_straight_line_is_180(self):
+        lm = (Point(0.0, 0.0), Point(0.0, -35.0), Point(0.0, -80.0))
+        assert _pip_angle_deg(lm, 0, 1, 2) == pytest.approx(180.0)
+
+    def test_folded_back_is_0(self):
+        lm = (Point(0.0, 0.0), Point(0.0, -35.0), Point(0.0, 10.0))
+        assert _pip_angle_deg(lm, 0, 1, 2) == pytest.approx(0.0)
+
+    def test_right_angle_bend_is_90(self):
+        lm = (Point(0.0, 0.0), Point(0.0, -35.0), Point(-45.0, -35.0))
+        assert _pip_angle_deg(lm, 0, 1, 2) == pytest.approx(90.0)
+
+    def test_degenerate_coincident_points_treated_as_straight(self):
+        lm = (Point(0.0, 0.0), Point(0.0, -35.0), Point(0.0, -35.0))
+        assert _pip_angle_deg(lm, 0, 1, 2) == 180.0
+
+
+class TestFingerStateHysteresis:
+    def test_latches_extended_and_ignores_midband_noise(self):
+        fs = _FingerState()
+        assert fs.update(170.0, 160.0, 130.0) is True  # clears extend threshold
+        # Oscillate inside the dead zone between curl(130) and extend(160):
+        # a naive single-threshold test would flicker on every one of these;
+        # the latch, once set, must not.
+        for angle in (145.0, 132.0, 158.0, 131.0, 150.0):
+            assert fs.update(angle, 160.0, 130.0) is True
+        assert fs.update(120.0, 160.0, 130.0) is False  # clears curl threshold
+
+    def test_starts_curled_and_stays_so_in_midband(self):
+        fs = _FingerState()
+        assert fs.update(145.0, 160.0, 130.0) is False
+
+    def test_reset_returns_to_curled(self):
+        fs = _FingerState()
+        fs.update(170.0, 160.0, 130.0)
+        fs.reset()
+        assert fs.update(145.0, 160.0, 130.0) is False
+
+
+class TestBentJointPoseClassification:
+    """Regression coverage for the exact gap pose_fixtures.py's docstring
+    describes: helpers.py's collinear "half" fixture reads as fully
+    extended (180 deg) under the angle metric, so it can never prove a
+    genuinely half-curled/relaxed hand "matches no pose" (engine.py module
+    docstring: "a relaxed hand keeps POINTER" without tripping any other
+    gesture) — these bent-joint fixtures actually flex the PIP joint."""
+
+    def _engine(self):
+        cfg = Config()
+        return GestureEngine(cfg, lambda name, raw, ts: raw), cfg
+
+    def test_genuinely_half_curled_hand_matches_no_pose(self):
+        eng, _ = self._engine()
+        frame = make_bent_frame(
+            0.0, {"index": 90.0, "middle": 90.0, "ring": 90.0, "pinky": 90.0}
+        )
+        lm = eng._smoother.smooth(frame)
+        assert eng._pointer_pose(lm) is False
+        assert eng._open_palm_pose(lm) is False
+        assert eng._scroll_pose(lm, frame.scale) is False
+        assert eng._horns_pose(lm) is False
+
+    def test_genuinely_extended_hand_matches_open_palm(self):
+        eng, _ = self._engine()
+        frame = make_bent_frame(
+            0.0, {"index": 180.0, "middle": 180.0, "ring": 180.0, "pinky": 180.0}
+        )
+        lm = eng._smoother.smooth(frame)
+        assert eng._open_palm_pose(lm) is True
+
+    def test_genuine_pointer_shape_matches_pointer_only(self):
+        eng, _ = self._engine()
+        frame = make_bent_frame(
+            0.0, {"index": 180.0, "middle": 0.0, "ring": 0.0, "pinky": 0.0}
+        )
+        lm = eng._smoother.smooth(frame)
+        assert eng._pointer_pose(lm) is True
+        assert eng._open_palm_pose(lm) is False
+
+
+class TestRetunePoseSmoothing:
+    def test_pushes_cfg_mincutoff_into_the_live_smoother(self):
+        cfg = Config()
+        eng = GestureEngine(cfg, lambda name, raw, ts: raw)
+        eng._smoother.smooth(make_bent_frame(0.0, {"index": 180.0}))  # primes filters
+        cfg.pose.smoothing_mincutoff = 8.25
+        eng.retune_pose_smoothing()
+        for fx, fy in eng._smoother._filters.values():
+            assert fx.mincutoff == 8.25
+            assert fy.mincutoff == 8.25
+
+
+class TestLandmarkPreSmoothingReducesFlicker:
+    def test_smoothing_cuts_boundary_flicker_beyond_hysteresis_alone(self):
+        # A finger held near the extend/curl midpoint with realistic
+        # per-frame jitter: raw angles (even through the SAME hysteresis
+        # latch) still cross both thresholds often; pre-smoothing the
+        # landmarks (as engine.update() now does before every pose test)
+        # must cut that further. This isolates smoothing's own contribution
+        # on top of the hysteresis fix — the exact failure mode behind
+        # "gets the gesture sometimes, mostly misses."
+        rng = random.Random(0)
+        cfg = Config()
+        smoother = LandmarkSmoother(cfg)
+        raw_state, smoothed_state = _FingerState(), _FingerState()
+        raw_flips = smoothed_flips = 0
+        raw_prev = smoothed_prev = None
+        base_angle = 150.0  # midpoint of extend(160)/curl(130)
+        t = 0.0
+        for _ in range(120):
+            angle = max(0.0, min(180.0, base_angle + rng.uniform(-25.0, 25.0)))
+            frame = make_bent_frame(t, {"index": angle})
+            lm_smooth = smoother.smooth(frame)
+            angle_raw = _pip_angle_deg(frame.landmarks, INDEX_MCP, INDEX_PIP, INDEX_TIP)
+            angle_smooth = _pip_angle_deg(lm_smooth, INDEX_MCP, INDEX_PIP, INDEX_TIP)
+            r = raw_state.update(angle_raw, cfg.pose.extend_angle_deg, cfg.pose.curl_angle_deg)
+            s = smoothed_state.update(
+                angle_smooth, cfg.pose.extend_angle_deg, cfg.pose.curl_angle_deg
+            )
+            if raw_prev is not None and r != raw_prev:
+                raw_flips += 1
+            if smoothed_prev is not None and s != smoothed_prev:
+                smoothed_flips += 1
+            raw_prev, smoothed_prev = r, s
+            t += STEP_MS
+        assert smoothed_flips < raw_flips

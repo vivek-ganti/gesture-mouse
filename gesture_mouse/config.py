@@ -150,6 +150,42 @@ class TrackingConfig:
 
 
 @dataclass
+class PreviewConfig:
+    """Fixed internal canvas size for the preview window, independent of the
+    camera's actual capture resolution (AVFoundation/OpenCV presets are not
+    guaranteed -- cameras silently fall back to whatever they support).
+    Every session state (IDLE/WARMUP/SUSPENDED/ACTIVE) renders into this
+    same size, so the window never resizes/jumps, and every fixed-pixel UI
+    constant in preview.py is tuned against it. The real camera frame is
+    stretch-resized into this canvas each draw."""
+
+    canvas_w: int = 960
+    canvas_h: int = 540
+
+
+@dataclass
+class PoseConfig:
+    """Static pose classification: per-finger extension/curl via the
+    interior angle at the PIP joint (angle between the MCP->PIP and
+    PIP->TIP vectors; 180 = perfectly straight, smaller = more curled).
+    Two thresholds give a real hysteresis band instead of one hard cutoff
+    -- mirrors the engage/release pattern already used for pinch detection.
+    Live-tunable at runtime (see preview key bindings) since the right
+    values depend on individual hand geometry and camera angle.
+
+    smoothing_* configure a One Euro filter applied to landmark coordinates
+    BEFORE pose classification runs (separate from CursorPipeline's own
+    anchor filter) -- a higher mincutoff than the cursor filter is fine
+    since pose tests only need a stable boolean, not px-accurate tracking."""
+
+    extend_angle_deg: float = 160.0
+    curl_angle_deg: float = 130.0
+    smoothing_mincutoff: float = 1.5
+    smoothing_beta: float = 0.02
+    smoothing_dcutoff: float = 1.0
+
+
+@dataclass
 class SuspendConfig:
     mouse_divergence_px: float = 8.0
     keyboard_mute_ms: float = 1500.0
@@ -217,6 +253,8 @@ class Config:
     clutch: ClutchConfig = field(default_factory=ClutchConfig)
     palm: PalmConfig = field(default_factory=PalmConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
+    preview: PreviewConfig = field(default_factory=PreviewConfig)
+    pose: PoseConfig = field(default_factory=PoseConfig)
     suspend: SuspendConfig = field(default_factory=SuspendConfig)
     hands_lost_ms: float = 265.0
     # Pose holds (clutch engage, scroll entry, PALM entry/exit) tolerate up to

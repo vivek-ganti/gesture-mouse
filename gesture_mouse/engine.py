@@ -32,23 +32,27 @@ that requires ``clutch.reacquire_ms`` of pointer pose.
 """
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
 from .config import Config
+from .filters import LandmarkSmoother
 from .types import (
     INDEX_MCP,
     INDEX_PIP,
     INDEX_TIP,
+    MIDDLE_MCP,
     MIDDLE_PIP,
     MIDDLE_TIP,
+    PINKY_MCP,
     PINKY_PIP,
     PINKY_TIP,
+    RING_MCP,
     RING_PIP,
     RING_TIP,
     THUMB_TIP,
-    WRIST,
     CursorSample,
     EngineState,
     Intent,
@@ -58,8 +62,6 @@ from .types import (
     dist,
 )
 
-# Radial finger-extension test factor (plan doc §Gesture vocabulary).
-_EXTENDED_RATIO = 1.15
 # Sustained low tracker confidence degrades like a missing hand.
 _LOW_CONF = 0.4
 _LOW_CONF_MS = 165.0
@@ -136,6 +138,47 @@ class _Debounced:
         self._false_since = None
 
 
+def _pip_angle_deg(lm: tuple[Point, ...], mcp: int, pip: int, tip: int) -> float:
+    """Interior angle at the PIP joint, degrees: 180 = perfectly straight
+    (MCP, PIP, TIP colinear), shrinking toward 0 as the finger curls back on
+    itself. Scale/rotation invariant (unlike a tip-to-wrist distance ratio,
+    which is sensitive to hand tilt/yaw toward the camera) — replaces the
+    old radial extension test (plan doc: gesture reliability research)."""
+    ax, ay = lm[mcp].x - lm[pip].x, lm[mcp].y - lm[pip].y  # PIP -> MCP
+    bx, by = lm[tip].x - lm[pip].x, lm[tip].y - lm[pip].y  # PIP -> TIP
+    na, nb = math.hypot(ax, ay), math.hypot(bx, by)
+    if na <= 1e-9 or nb <= 1e-9:
+        return 180.0  # degenerate (coincident points): treat as straight
+    cos_a = max(-1.0, min(1.0, (ax * bx + ay * by) / (na * nb)))
+    return math.degrees(math.acos(cos_a))
+
+
+class _FingerState:
+    """Two-threshold hysteresis latch for one finger's extended/curled
+    state (plan doc: gesture reliability research), replacing a single
+    hard-cutoff ratio test. Mirrors the engage/release pattern already used
+    for pinch detection: a finger only becomes "extended" once its PIP
+    angle clears the (high) extend threshold, and only reverts to "curled"
+    once it drops below the (lower) curl threshold — a finger sitting
+    between the two stays whatever it last was, instead of flickering every
+    frame the way a single instant cutoff does."""
+
+    __slots__ = ("extended",)
+
+    def __init__(self) -> None:
+        self.extended = False
+
+    def update(self, angle_deg: float, extend_at: float, curl_at: float) -> bool:
+        if self.extended and angle_deg <= curl_at:
+            self.extended = False
+        elif not self.extended and angle_deg >= extend_at:
+            self.extended = True
+        return self.extended
+
+    def reset(self) -> None:
+        self.extended = False
+
+
 class GestureEngine:
     def __init__(
         self,
@@ -160,6 +203,17 @@ class GestureEngine:
         grace = self.cfg.pose_jitter_grace_ms
         self._clutch_required = clutch_required
         self._clutch_hold = _Debounced(grace)
+        # Landmark pre-smoothing for pose classification (separate from the
+        # cursor pipeline's own anchor filter) + per-finger hysteresis
+        # latches, both stateful and both re-created here so a hand
+        # reacquired after a full reset/suspend starts from a clean slate
+        # rather than carrying stale filter/latch state from the old hand.
+        self._smoother = LandmarkSmoother(self.cfg)
+        self._lm_smooth: tuple[Point, ...] | None = None
+        self._finger_index = _FingerState()
+        self._finger_middle = _FingerState()
+        self._finger_ring = _FingerState()
+        self._finger_pinky = _FingerState()
         self._cursor_hist: deque[tuple[float, float, float]] = deque()
         self._scale_hist: deque[tuple[float, float]] = deque()
         self._last_ts: float | None = None
@@ -239,6 +293,14 @@ class GestureEngine:
         if self._palm is not None:
             self._palm.reset()
 
+    def retune_pose_smoothing(self) -> None:
+        """Live-tune: push ``cfg.pose.smoothing_mincutoff`` into the
+        landmark smoother's already-constructed per-index filters (additive
+        to the CONTRACTS.md surface, mirrors ``CursorPipeline.set_beta``).
+        ``extend_angle_deg``/``curl_angle_deg`` need no such call — ``_ext``
+        reads them straight from ``cfg.pose`` every frame."""
+        self._smoother.set_mincutoff(self.cfg.pose.smoothing_mincutoff)
+
     @property
     def pinch_values(self) -> dict[str, float]:
         """Latest filtered pinch distances for the preview meters (additive to
@@ -268,46 +330,48 @@ class GestureEngine:
 
     # -- pose tests ---------------------------------------------------------
 
-    def _ext(self, lm: tuple[Point, ...], tip: int, pip: int, wrist: Point) -> bool:
+    def _ext(
+        self, finger: _FingerState, lm: tuple[Point, ...], mcp: int, pip: int, tip: int
+    ) -> bool:
         if self.cfg.options.extended_test == "y":
             # Mirrored frame is y-down: an extended (upward-pointing) finger
             # has its tip above its PIP. Config alternative for camera-down
-            # geometry where the radial test's wrist distances compress.
+            # geometry where the PIP-angle test's perspective compresses.
             return lm[tip].y < lm[pip].y
-        return dist(lm[tip], wrist) > _EXTENDED_RATIO * dist(lm[pip], wrist)
+        p = self.cfg.pose
+        angle = _pip_angle_deg(lm, mcp, pip, tip)
+        return finger.update(angle, p.extend_angle_deg, p.curl_angle_deg)
 
     def _index_extended(self, lm: tuple[Point, ...]) -> bool:
-        return self._ext(lm, INDEX_TIP, INDEX_PIP, lm[WRIST])
+        return self._ext(self._finger_index, lm, INDEX_MCP, INDEX_PIP, INDEX_TIP)
 
     def _pointer_pose(self, lm: tuple[Point, ...]) -> bool:
-        w = lm[WRIST]
         return (
-            self._ext(lm, INDEX_TIP, INDEX_PIP, w)
-            and not self._ext(lm, MIDDLE_TIP, MIDDLE_PIP, w)
-            and not self._ext(lm, RING_TIP, RING_PIP, w)
-            and not self._ext(lm, PINKY_TIP, PINKY_PIP, w)
+            self._ext(self._finger_index, lm, INDEX_MCP, INDEX_PIP, INDEX_TIP)
+            and not self._ext(self._finger_middle, lm, MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP)
+            and not self._ext(self._finger_ring, lm, RING_MCP, RING_PIP, RING_TIP)
+            and not self._ext(self._finger_pinky, lm, PINKY_MCP, PINKY_PIP, PINKY_TIP)
         )
 
     def _open_palm_pose(self, lm: tuple[Point, ...]) -> bool:
         """Four fingers extended — deliberately EXCLUDES the thumb.
 
         The trackpad gesture this mirrors ("4-finger swipe") never needed the
-        thumb either, and the thumb's radial-from-wrist extension test is the
-        least reliable of the five: the thumb's range of motion is mostly
-        lateral (across the palm), not radial from the wrist, so on a real
-        hand it very often reads as "curled" even when visibly splayed out —
+        thumb either, and the thumb's own extension geometry is the least
+        reliable of the five: its range of motion is mostly lateral (across
+        the palm), not a simple hinge like the other four, so on a real hand
+        it very often reads as "curled" even when visibly splayed out —
         silently blocking every four/five-finger gesture behind a pose that
         can almost never be satisfied. Five-finger pinch-in/spread-out
         (Launchpad/Show Desktop) don't use this pose test at all — they
         already read the thumb through the continuous spread metric in
         palm.py, which has no such failure mode.
         """
-        w = lm[WRIST]
         return (
-            self._ext(lm, INDEX_TIP, INDEX_PIP, w)
-            and self._ext(lm, MIDDLE_TIP, MIDDLE_PIP, w)
-            and self._ext(lm, RING_TIP, RING_PIP, w)
-            and self._ext(lm, PINKY_TIP, PINKY_PIP, w)
+            self._ext(self._finger_index, lm, INDEX_MCP, INDEX_PIP, INDEX_TIP)
+            and self._ext(self._finger_middle, lm, MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP)
+            and self._ext(self._finger_ring, lm, RING_MCP, RING_PIP, RING_TIP)
+            and self._ext(self._finger_pinky, lm, PINKY_MCP, PINKY_PIP, PINKY_TIP)
         )
 
     def _horns_pose(self, lm: tuple[Point, ...]) -> bool:
@@ -315,12 +379,11 @@ class GestureEngine:
         ignored (unreliable). Mutually exclusive with pointer (pinky curled
         there), scroll (middle extended there) and open-palm (middle+ring
         extended there) — so it can't collide with any built-in gesture."""
-        w = lm[WRIST]
         return (
-            self._ext(lm, INDEX_TIP, INDEX_PIP, w)
-            and self._ext(lm, PINKY_TIP, PINKY_PIP, w)
-            and not self._ext(lm, MIDDLE_TIP, MIDDLE_PIP, w)
-            and not self._ext(lm, RING_TIP, RING_PIP, w)
+            self._ext(self._finger_index, lm, INDEX_MCP, INDEX_PIP, INDEX_TIP)
+            and self._ext(self._finger_pinky, lm, PINKY_MCP, PINKY_PIP, PINKY_TIP)
+            and not self._ext(self._finger_middle, lm, MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP)
+            and not self._ext(self._finger_ring, lm, RING_MCP, RING_PIP, RING_TIP)
         )
 
     # Pose name -> test method; extend here when adding new custom poses.
@@ -328,12 +391,11 @@ class GestureEngine:
         return {"horns": self._horns_pose}.get(pose)
 
     def _scroll_pose(self, lm: tuple[Point, ...], scale: float) -> bool:
-        w = lm[WRIST]
         if not (
-            self._ext(lm, INDEX_TIP, INDEX_PIP, w)
-            and self._ext(lm, MIDDLE_TIP, MIDDLE_PIP, w)
-            and not self._ext(lm, RING_TIP, RING_PIP, w)
-            and not self._ext(lm, PINKY_TIP, PINKY_PIP, w)
+            self._ext(self._finger_index, lm, INDEX_MCP, INDEX_PIP, INDEX_TIP)
+            and self._ext(self._finger_middle, lm, MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP)
+            and not self._ext(self._finger_ring, lm, RING_MCP, RING_PIP, RING_TIP)
+            and not self._ext(self._finger_pinky, lm, PINKY_MCP, PINKY_PIP, PINKY_TIP)
         ):
             return False
         return dist(lm[INDEX_TIP], lm[MIDDLE_TIP]) / scale < self.cfg.scroll.together_max
@@ -453,17 +515,28 @@ class GestureEngine:
         valid = self._hand_valid(frame, ts)
         open_palm = False
         anchor: Point | None = None
+        self._lm_smooth = None
 
         if valid:
-            lm = frame.landmarks
+            lm_raw = frame.landmarks
+            assert lm_raw is not None
+            # Pose classification runs on a SEPARATELY smoothed copy of the
+            # landmarks (plan doc: gesture reliability research) — raw
+            # per-frame camera/tracker jitter fed straight into the old
+            # instant-cutoff extension test, which is why gestures "worked
+            # sometimes, mostly missed." Distance-based signals below (pinch,
+            # scale) already have their own, better-tuned filters and stay on
+            # the raw landmarks; smoothing them again would just add lag.
+            self._lm_smooth = self._smoother.smooth(frame)
+            lm = self._lm_smooth
             assert lm is not None
-            anchor = lm[INDEX_MCP]
+            anchor = lm_raw[INDEX_MCP]
             open_palm = self._open_palm_pose(lm)
             self._left_val = self._pinch_filter(
-                "left", dist(lm[THUMB_TIP], lm[INDEX_TIP]) / frame.scale, ts
+                "left", dist(lm_raw[THUMB_TIP], lm_raw[INDEX_TIP]) / frame.scale, ts
             )
             self._right_val = self._pinch_filter(
-                "right", dist(lm[THUMB_TIP], lm[MIDDLE_TIP]) / frame.scale, ts
+                "right", dist(lm_raw[THUMB_TIP], lm_raw[MIDDLE_TIP]) / frame.scale, ts
             )
             self._scale_hist.append((ts, frame.scale))
             self._cursor_hist.append((ts, cursor.x, cursor.y))
@@ -505,7 +578,7 @@ class GestureEngine:
 
         st = self.state
         if st is EngineState.CLUTCH_WAIT:
-            rebase = self._tick_clutch(frame, cursor, ts, valid)
+            rebase = self._tick_clutch(cursor, ts, valid)
         elif st is EngineState.POINTER:
             rebase = self._tick_pointer(
                 frame, cursor, ts, stable, open_palm_since, intents
@@ -519,7 +592,7 @@ class GestureEngine:
         elif st is EngineState.PALM:
             rebase = self._tick_palm(cursor, open_palm_debounced)
         elif st is EngineState.HANDS_LOST:
-            rebase = self._tick_hands_lost(frame, cursor, ts, valid, intents)
+            rebase = self._tick_hands_lost(cursor, ts, valid, intents)
 
         # Custom gestures: static pose (e.g. horns 🤘) held hold_ms at a
         # mostly-still hand -> one TRIGGER carrying its action. Evaluated
@@ -535,7 +608,7 @@ class GestureEngine:
             and self._arb is None
             and cursor.speed_px_s < self.cfg.palm.forward_max_speed_px_s
         ):
-            lm = frame.landmarks
+            lm = self._lm_smooth
             assert lm is not None
             for g in self._custom:
                 test = self._custom_pose_test(g["pose"])
@@ -609,9 +682,9 @@ class GestureEngine:
     # -- per-state ticks -----------------------------------------------------
 
     def _tick_clutch(
-        self, frame: LandmarkFrame, cursor: CursorSample, ts: float, valid: bool
+        self, cursor: CursorSample, ts: float, valid: bool
     ) -> tuple[float, float] | None:
-        pose = valid and frame.landmarks is not None and self._pointer_pose(frame.landmarks)
+        pose = valid and self._lm_smooth is not None and self._pointer_pose(self._lm_smooth)
         since = self._clutch_hold.update(ts, pose)
         if since is not None and ts - since >= self._clutch_required:
             self._to_pointer()
@@ -627,7 +700,9 @@ class GestureEngine:
         open_palm_since: float | None,
         intents: list[Intent],
     ) -> tuple[float, float] | None:
-        lm = frame.landmarks
+        lm_raw = frame.landmarks
+        assert lm_raw is not None
+        lm = self._lm_smooth
         assert lm is not None
         pinch_active = (
             self._left_since is not None
@@ -665,8 +740,10 @@ class GestureEngine:
             self.state = EngineState.SCROLL
             self._scroll_hold.reset()
             self._scroll_exit_since = None
-            self._scroll_y0 = lm[INDEX_MCP].y
-            self._scroll_x0 = lm[INDEX_MCP].x
+            # Origin is RAW (matches the raw deflection reads in
+            # _tick_scroll) — continuous motion tracking, not classification.
+            self._scroll_y0 = lm_raw[INDEX_MCP].y
+            self._scroll_x0 = lm_raw[INDEX_MCP].x
             self._clear_pinch()
             self._disarm_palm()
             return None
@@ -930,21 +1007,27 @@ class GestureEngine:
         intents: list[Intent],
     ) -> tuple[float, float] | None:
         sc = self.cfg.scroll
-        lm = frame.landmarks
+        lm_raw = frame.landmarks
+        assert lm_raw is not None
+        lm = self._lm_smooth
         assert lm is not None
         if self._scroll_pose(lm, frame.scale):
             self._scroll_exit_since = None
             # Horizontal joystick in the same pose = tab switch. One trigger
             # per deflection past the dead zone, then a refractory; the origin
             # re-latches so holding the hand off-center doesn't machine-gun.
-            dx_frac = (lm[INDEX_MCP].x - self._scroll_x0) / frame.img_w
+            # Deflection reads are RAW (continuous motion tracking, matching
+            # the RAW origin set on SCROLL entry) — only the pose test itself
+            # (whether the scroll hand-shape is currently held) uses smoothed
+            # landmarks.
+            dx_frac = (lm_raw[INDEX_MCP].x - self._scroll_x0) / frame.img_w
             if abs(dx_frac) > sc.tab_deadzone_frac and ts >= self._tab_block_until:
                 # Mirrored (selfie) frame: hand moving right = +x = next tab.
                 name = "tab_next" if dx_frac > 0 else "tab_prev"
                 intents.append(Intent(name, Phase.TRIGGER, {}, ts))
                 self._tab_block_until = ts + sc.tab_refractory_ms
-                self._scroll_x0 = lm[INDEX_MCP].x
-            deflection = (lm[INDEX_MCP].y - self._scroll_y0) / frame.img_h
+                self._scroll_x0 = lm_raw[INDEX_MCP].x
+            deflection = (lm_raw[INDEX_MCP].y - self._scroll_y0) / frame.img_h
             mag = abs(deflection) - sc.deadzone_frac
             dt_s = 0.0
             if self._last_ts is not None and ts > self._last_ts:
@@ -987,7 +1070,6 @@ class GestureEngine:
 
     def _tick_hands_lost(
         self,
-        frame: LandmarkFrame,
         cursor: CursorSample,
         ts: float,
         valid: bool,
@@ -1001,7 +1083,7 @@ class GestureEngine:
         ):
             intents.extend(self._release_held(ts))
 
-        pose = valid and frame.landmarks is not None and self._pointer_pose(frame.landmarks)
+        pose = valid and self._lm_smooth is not None and self._pointer_pose(self._lm_smooth)
         since = self._reacquire_hold.update(ts, pose)
         if since is not None and ts - since >= self.cfg.clutch.reacquire_ms:
             # Safety: if the hand came back fast enough that the auto-UP

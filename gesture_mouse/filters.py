@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 
 from .config import Config
-from .types import INDEX_MCP, CursorSample, LandmarkFrame
+from .types import INDEX_MCP, CursorSample, LandmarkFrame, Point
 
 # Below this output speed the emitted position is rounded to whole pixels to
 # kill sub-pixel shimmer at rest (~2 px/frame at 30 fps).
@@ -96,6 +96,55 @@ class OneEuro:
         if mincutoff <= 0.0:
             raise ValueError("mincutoff must be positive")
         self.mincutoff = mincutoff
+
+
+class LandmarkSmoother:
+    """Per-landmark-index One Euro filtering for POSE CLASSIFICATION, kept
+    entirely separate from ``CursorPipeline``'s own anchor filter.
+
+    Every static pose test in ``engine.py`` (pointer, open-palm, scroll,
+    horns) used to run on raw per-frame landmark coordinates, so camera/
+    MediaPipe jitter fed straight into the finger-angle classifier with no
+    damping — the same class of noise ``CursorPipeline`` already smooths
+    away for cursor motion and pinch distance. This applies that same
+    technique upstream of pose classification: smooth first, classify
+    second. Tuned independently (``cfg.pose.smoothing_*``, typically a
+    higher mincutoff than the cursor filter) since pose tests only need a
+    stable boolean, not px-accurate tracking, so a little more lag here is
+    a good trade for a lot less flicker.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self._filters: dict[int, tuple[OneEuro, OneEuro]] = {}
+
+    def smooth(self, frame: LandmarkFrame) -> tuple[Point, ...] | None:
+        if frame.landmarks is None:
+            return None
+        p = self._cfg.pose
+        out = []
+        for i, pt in enumerate(frame.landmarks):
+            axes = self._filters.get(i)
+            if axes is None:
+                axes = (
+                    OneEuro(p.smoothing_mincutoff, p.smoothing_beta, p.smoothing_dcutoff),
+                    OneEuro(p.smoothing_mincutoff, p.smoothing_beta, p.smoothing_dcutoff),
+                )
+                self._filters[i] = axes
+            fx, fy = axes
+            out.append(Point(fx.filter(pt.x, frame.ts_ms), fy.filter(pt.y, frame.ts_ms)))
+        return tuple(out)
+
+    def set_mincutoff(self, mincutoff: float) -> None:
+        """Live-tune: push a new mincutoff into every already-constructed
+        per-index filter (new indices pick it up naturally since they read
+        ``cfg.pose.smoothing_mincutoff`` fresh on first use)."""
+        for fx, fy in self._filters.values():
+            fx.set_mincutoff(mincutoff)
+            fy.set_mincutoff(mincutoff)
+
+    def reset(self) -> None:
+        self._filters.clear()
 
 
 class CursorPipeline:

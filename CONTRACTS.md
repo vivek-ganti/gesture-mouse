@@ -54,6 +54,17 @@ class CursorPipeline:
     def pinch(self, name: str, raw: float, ts_ms: float) -> float
         # per-name One Euro (pinch_mincutoff) for pinch distances; engine calls this
     def reset(self) -> None
+
+class LandmarkSmoother:
+    """Per-landmark-index One Euro filtering for POSE CLASSIFICATION, kept
+    separate from CursorPipeline's own anchor filter (cfg.pose.smoothing_*,
+    typically a higher mincutoff than the cursor filter -- pose tests only
+    need a stable boolean, not px-accurate tracking)."""
+    def __init__(self, cfg: Config): ...
+    def smooth(self, frame: LandmarkFrame) -> tuple[Point, ...] | None
+        # None when frame.landmarks is None; else all 21 points filtered
+    def set_mincutoff(self, mincutoff: float) -> None   # live-tune, see engine.py
+    def reset(self) -> None
 ```
 
 ## engine.py
@@ -73,7 +84,23 @@ class GestureEngine:
     def update(self, frame: LandmarkFrame, cursor: CursorSample) -> EngineOutput
     def notify_suspended(self) -> None    # force-release held buttons state (emit UPs first)
     def reset(self) -> None
+    def retune_pose_smoothing(self) -> None
+        # live-tune: push cfg.pose.smoothing_mincutoff into the already-
+        # constructed LandmarkSmoother filters (see __main__.py live-tune keys)
 ```
+
+Finger extension (`_ext`, used by every static pose test below) is an
+ANGLE metric, not the old tip-to-wrist ratio: `_pip_angle_deg` computes the
+interior angle at the PIP joint (MCP->PIP vs PIP->TIP vectors; 180 =
+straight/extended, 0 = folded/curled), and a per-finger `_FingerState`
+latches "extended" only above `cfg.pose.extend_angle_deg` and back to
+"curled" only below `cfg.pose.curl_angle_deg` — real hysteresis, mirroring
+the engage/release pattern pinch detection already used, replacing a single
+instant-cutoff boolean. Pose tests run on landmarks pre-smoothed by a
+`LandmarkSmoother` (One Euro per landmark index, `cfg.pose.smoothing_*`) —
+distance-based signals (pinch, scale, anchor-jump, scroll/tab joystick
+deflection) keep using RAW landmarks, since they already have their own,
+better-tuned filters or need unfiltered continuous motion.
 
 Implements (rules + exact thresholds in the plan doc §Gesture vocabulary):
 CLUTCH_WAIT -> pointer-pose 150ms -> POINTER (emit rebase, no cursor jump);
@@ -262,6 +289,20 @@ class Preview:                            # cv2 tuning window
     def close(self) -> None
 ```
 
+Preview renders onto a FIXED internal canvas (`cfg.preview.canvas_w/h`, not
+the camera's actual capture size — AVFoundation/OpenCV presets are not
+guaranteed) in every session state, so the window never resizes/jumps.
+`_fit_frame_to_canvas` stretch-resizes the real/black frame into it every
+draw (stretch, not letterbox: privacy mode's synthetic skeleton makes minor
+distortion low-cost, and it needs no padding-offset math); `_draw_skeleton`
+rescales landmark points (in the frame's OWN original pixel space) to match.
+`_compute_regions` hands every text element (status, hint, camera list) a
+reserved, non-overlapping y-position instead of each draw function picking
+one independently. Does NOT attempt to work around `cv2.imshow`'s Retina/
+HiDPI window-scaling behavior on macOS (open, unfixed OpenCV limitation,
+upstream issue #20403) — a correctly laid out fixed canvas stays legible
+regardless of what scale the OS renders the window at.
+
 ## __main__.py
 
 argparse: `--list-cameras`, `--camera NAME`, `--config PATH`, `--replay FILE`,
@@ -270,10 +311,11 @@ Flow: preflight permissions (skip for --replay/--list-cameras) -> wiring ->
 session FSM (IDLE camera-off default; toggle/panic via threading.Event from
 hotkeys; WARMUP until first confident frame or 2s; SUSPENDED on guard trip,
 resume only via clutch reacquire or toggle) -> hot loop per Pipeline order ->
-live-tune keys ([ ] mincutoff, ; ' beta, b box, p privacy, q quit) ->
-try/finally + atexit -> synth.release_all(). PerfTimer prints p50/p95 per stage
-every 5s. Replay mode: no synth posts (print intents instead) unless
-`--replay-post` given.
+live-tune keys ([ ] mincutoff, ; ' beta, - = pose extend/curl angle
+thresholds, , . pose smoothing mincutoff, b box, p privacy, h help, 1-9
+switch camera, q quit) -> try/finally + atexit -> synth.release_all().
+PerfTimer prints p50/p95 per stage every 5s. Replay mode: no synth posts
+(print intents instead) unless `--replay-post` given.
 
 ## tests/
 

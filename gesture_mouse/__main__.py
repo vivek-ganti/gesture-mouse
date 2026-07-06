@@ -57,6 +57,9 @@ _CAMERA_REFRESH_PERIOD_S = 3.0  # camera-list re-enumeration cadence
 _PERF_PERIOD_S = 5.0       # PerfTimer print cadence
 _TUNE_STEP = 1.25          # [ ] multiplicative step for mincutoff
 _BETA_STEP = 1.5           # ; ' multiplicative step for beta
+_POSE_SMOOTH_STEP = 1.25   # , . multiplicative step for pose smoothing mincutoff
+_ANGLE_STEP = 5.0          # - = additive step (deg) for pose extend/curl thresholds
+_MIN_ANGLE_GAP = 5.0       # keep curl_angle_deg clearly below extend_angle_deg
 
 
 class PerfTimer:
@@ -290,13 +293,19 @@ class App:
         self.pipeline.set_beta(self.cfg.one_euro.beta)
         print(f"[tune] {msg}")
 
+    def _apply_pose_tuning(self, msg: str) -> None:
+        self.engine.retune_pose_smoothing()
+        print(f"[tune] {msg}")
+
     def _handle_key(self, key: int) -> None:
         """Live-tune keys from cv2.waitKey: [ ] mincutoff, ; ' beta,
+        - = pose extend/curl angle thresholds, , . pose smoothing mincutoff,
         b box overlay, p privacy, 1-9 switch camera, q quit."""
         if key < 0:
             return
         ch = chr(key & 0xFF) if 32 <= (key & 0xFF) < 127 else ""
         oe = self.cfg.one_euro
+        p = self.cfg.pose
         if ch in ("q", "Q"):
             self._quit = True
         elif ch == "[":
@@ -311,6 +320,26 @@ class App:
         elif ch == "'":
             oe.beta = min(1.0, max(oe.beta, 1e-5) * _BETA_STEP)
             self._apply_filter_tuning(f"beta={oe.beta:.5f}")
+        elif ch == "-":
+            # More forgiving: a finger needs less straightening to read as
+            # "extended" and less curling to read as "curled" (plan doc:
+            # gesture reliability — these are the angle-hysteresis
+            # thresholds that replaced the old single ratio cutoff).
+            p.extend_angle_deg = max(p.curl_angle_deg + _MIN_ANGLE_GAP,
+                                      p.extend_angle_deg - _ANGLE_STEP)
+            p.curl_angle_deg = max(0.0, p.curl_angle_deg - _ANGLE_STEP)
+            print(f"[tune] pose extend={p.extend_angle_deg:.0f} curl={p.curl_angle_deg:.0f}")
+        elif ch == "=":
+            p.extend_angle_deg = min(180.0, p.extend_angle_deg + _ANGLE_STEP)
+            p.curl_angle_deg = min(p.extend_angle_deg - _MIN_ANGLE_GAP,
+                                    p.curl_angle_deg + _ANGLE_STEP)
+            print(f"[tune] pose extend={p.extend_angle_deg:.0f} curl={p.curl_angle_deg:.0f}")
+        elif ch == ",":
+            p.smoothing_mincutoff = max(0.1, p.smoothing_mincutoff / _POSE_SMOOTH_STEP)
+            self._apply_pose_tuning(f"pose smoothing mincutoff={p.smoothing_mincutoff:.3f}")
+        elif ch == ".":
+            p.smoothing_mincutoff = min(20.0, p.smoothing_mincutoff * _POSE_SMOOTH_STEP)
+            self._apply_pose_tuning(f"pose smoothing mincutoff={p.smoothing_mincutoff:.3f}")
         elif ch == "b" and self.preview is not None:
             self.preview.show_box = not self.preview.show_box
             print(f"[tune] control-box overlay {'on' if self.preview.show_box else 'off'}")

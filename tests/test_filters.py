@@ -13,7 +13,12 @@ import math
 import pytest
 
 from gesture_mouse.config import Config
-from gesture_mouse.filters import QUANTIZE_MAX_SPEED_PX_S, CursorPipeline, OneEuro
+from gesture_mouse.filters import (
+    QUANTIZE_MAX_SPEED_PX_S,
+    CursorPipeline,
+    LandmarkSmoother,
+    OneEuro,
+)
 from gesture_mouse.types import LandmarkFrame, Point
 
 SCREEN_W, SCREEN_H = 1920.0, 1080.0
@@ -344,6 +349,67 @@ class TestDragAndPinch:
             outs.append(pipe.pinch("left", raw, t))
         tail = outs[-20:]
         assert max(tail) - min(tail) < 0.1  # raw ptp is 0.2
+
+
+class TestLandmarkSmoother:
+    def test_first_frame_passes_through(self):
+        smoother = LandmarkSmoother(Config())
+        frame = make_frame(0.0, 100.0, 200.0)
+        out = smoother.smooth(frame)
+        assert out == frame.landmarks
+
+    def test_none_landmarks_returns_none(self):
+        smoother = LandmarkSmoother(Config())
+        assert smoother.smooth(make_frame(0.0, present=False)) is None
+
+    def test_smooths_jitter_after_priming(self):
+        smoother = LandmarkSmoother(Config())
+        outs = []
+        for k in range(31):
+            t = k * FRAME_MS
+            j = 3.0 * math.sin(2 * math.pi * 7.0 * t / 1000.0)
+            outs.append(smoother.smooth(make_frame(t, 100.0 + j, 200.0 + j)))
+        raw_ptp = 6.0
+        smoothed_x = [pt[0].x for pt in outs[-15:]]
+        assert max(smoothed_x) - min(smoothed_x) < raw_ptp
+
+    def test_per_index_independence(self):
+        smoother = LandmarkSmoother(Config())
+        pts = tuple(Point(float(i), float(i)) for i in range(21))
+        frame = LandmarkFrame(0.0, "Right", pts, IMG_W, IMG_H, 0.9, 100.0, "test")
+        smoother.smooth(frame)
+        pts2 = tuple(
+            Point(500.0, 500.0) if i == 8 else Point(float(i), float(i))
+            for i in range(21)
+        )
+        frame2 = LandmarkFrame(FRAME_MS, "Right", pts2, IMG_W, IMG_H, 0.9, 100.0, "test")
+        out = smoother.smooth(frame2)
+        assert out[4] == pts2[4]          # untouched index: filter primed at
+                                            # the same value, unaffected by 8's jump
+        assert out[8].x < 500.0            # jumped index: damped, not passthrough
+
+    def test_reset_clears_all_filters(self):
+        smoother = LandmarkSmoother(Config())
+        smoother.smooth(make_frame(0.0, 100.0, 100.0))
+        smoother.smooth(make_frame(FRAME_MS, 200.0, 200.0))
+        smoother.reset()
+        out = smoother.smooth(make_frame(0.0, 42.0, 42.0))
+        assert out[0].x == 42.0  # re-primed: first sample passes through
+
+    def test_set_mincutoff_updates_already_constructed_filters(self):
+        smoother = LandmarkSmoother(Config())
+        smoother.smooth(make_frame(0.0, 100.0, 100.0))  # primes filters for all 21 indices
+        smoother.set_mincutoff(9.5)
+        for fx, fy in smoother._filters.values():
+            assert fx.mincutoff == 9.5
+            assert fy.mincutoff == 9.5
+
+    def test_set_mincutoff_before_any_filter_exists_is_a_noop(self):
+        smoother = LandmarkSmoother(Config())
+        smoother.set_mincutoff(9.5)  # no filters constructed yet: nothing to update
+        smoother.smooth(make_frame(0.0, 100.0, 100.0))
+        fx, _ = smoother._filters[0]
+        assert fx.mincutoff == Config().pose.smoothing_mincutoff
 
 
 class TestReset:

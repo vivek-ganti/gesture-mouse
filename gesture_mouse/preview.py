@@ -5,13 +5,42 @@ on a black canvas — the camera image never reaches the screen. The camera
 image is only shown when privacy is explicitly disabled AND a BGR frame is
 available (``bgr_frame`` is None in replay).
 
+The preview renders onto a FIXED internal canvas (``cfg.preview.canvas_w``
+x ``canvas_h``) in every session state, never the camera's actual capture
+size. AVFoundation/OpenCV capture presets are not guaranteed — cameras
+silently fall back to whatever they support (plan doc: UI scaling/overlap
+fix) — so the real frame can be a different size than expected, in either
+direction. Every fixed-pixel UI constant in this module (meters, fonts, the
+help panel) is tuned against that one fixed size; the real camera frame is
+stretch-resized into it every draw via :func:`_fit_frame_to_canvas`, and
+landmark points (in the ORIGINAL frame's pixel space) are rescaled to match
+in :func:`_draw_skeleton`. Stretch, not letterbox: privacy mode (the
+default) draws a synthetic skeleton on black, not a real photo, so minor
+aspect distortion is low-cost, and stretch needs no padding-offset math
+threaded through every draw call.
+
+Layout collisions (status/hint text vs. the camera list) are prevented by
+giving each element its own reserved, non-overlapping region
+(:func:`_compute_regions`) instead of every draw function picking a fixed
+y-offset independently.
+
+Note: this deliberately does NOT attempt to correct ``cv2.imshow``'s known
+Retina/HiDPI window-scaling behavior on macOS (renders in raw pixels, so a
+2x-scale display shows the window ~2x larger than the image's pixel size
+warrants) — that's an open, unfixed OpenCV limitation (upstream issue
+#20403), not something fixable from here. A fixed, correctly-laid-out
+internal canvas stays legible regardless of what scale the OS ultimately
+draws it at; don't re-attempt a WINDOW_AUTOSIZE/DPI workaround.
+
 All drawing is factored into :func:`draw_overlay` — pure numpy/cv2 primitive
 calls on a caller-provided canvas, no window-server interaction — so tests run
 headless. ``Preview.show()`` only adds canvas selection, ``imshow`` and
 ``waitKey``; the window itself is created lazily on the first ``show()``.
-Total draw cost is a handful of cv2 primitives (well under 5 ms at 640x480).
+Total draw cost is a handful of cv2 primitives (well under 5 ms).
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -92,10 +121,27 @@ def _draw_control_box(canvas: np.ndarray, cfg: Config) -> None:
     cv2.rectangle(canvas, (x0, y0), (x1, y1), _WHITE, 1)
 
 
+def _fit_frame_to_canvas(src: np.ndarray, canvas_w: int, canvas_h: int) -> np.ndarray:
+    """Stretch-resize ``src`` (whatever size it actually is) to exactly
+    ``canvas_w`` x ``canvas_h``. Always returns a fresh array — even when
+    the sizes already match — so callers never draw on the caller's frame."""
+    if src.shape[1] == canvas_w and src.shape[0] == canvas_h:
+        return src.copy()
+    return cv2.resize(src, (canvas_w, canvas_h), interpolation=cv2.INTER_LINEAR)
+
+
 def _draw_skeleton(
-    canvas: np.ndarray, lm_frame: LandmarkFrame, color: tuple[int, int, int]
+    canvas: np.ndarray,
+    lm_frame: LandmarkFrame,
+    color: tuple[int, int, int],
+    sx: float = 1.0,
+    sy: float = 1.0,
 ) -> None:
-    pts = [(int(p.x), int(p.y)) for p in lm_frame.landmarks]
+    """``sx``/``sy`` rescale landmark points from the frame's ORIGINAL pixel
+    space (``lm_frame.img_w/img_h``) into the fixed display canvas's space —
+    they differ whenever the camera's actual capture size isn't the
+    canvas's fixed size, which per the module docstring is the common case."""
+    pts = [(int(p.x * sx), int(p.y * sy)) for p in lm_frame.landmarks]
     for a, b in HAND_BONES:
         cv2.line(canvas, pts[a], pts[b], color, 1, cv2.LINE_AA)
     for pt in pts:
@@ -220,7 +266,29 @@ _HINTS: dict[EngineState, str] = {
 }
 
 
-def _draw_status(canvas: np.ndarray, snap: StateSnapshot) -> None:
+@dataclass(frozen=True)
+class _Regions:
+    """Reserved, non-overlapping screen y-positions for one draw_overlay()
+    call. Every element reads its position from here instead of picking a
+    fixed offset independently — THIS is what actually prevents collisions
+    (plan doc: UI scaling/overlap fix), not the specific numbers below."""
+
+    status_y: int
+    hint_y: int
+    camera_list_top: int
+
+
+def _compute_regions(canvas_w: int, canvas_h: int) -> _Regions:
+    status_y = 18
+    hint_y = 36
+    # Stacked BELOW the status+hint block (not beside it, right-aligned as
+    # it is) so it can never collide with them regardless of how wide
+    # either line's text ends up being at any canvas size.
+    camera_list_top = hint_y + 20
+    return _Regions(status_y=status_y, hint_y=hint_y, camera_list_top=camera_list_top)
+
+
+def _draw_status(canvas: np.ndarray, snap: StateSnapshot, regions: _Regions) -> None:
     engine = snap.engine_state.value if snap.engine_state else "-"
     text = (
         f"{snap.session_state.value}:{engine}"
@@ -230,7 +298,7 @@ def _draw_status(canvas: np.ndarray, snap: StateSnapshot) -> None:
         text += f"  [{snap.suspend_reason}]"
     if not snap.hand_present:
         text += "  (no hand)"
-    _put_text(canvas, text, (8, 18), _state_color(snap))
+    _put_text(canvas, text, (8, regions.status_y), _state_color(snap))
 
     if snap.session_state is SessionState.SUSPENDED:
         hint = "you used mouse/keyboard - hold index finger up 250ms (or ctrl+alt+G) to resume"
@@ -241,7 +309,7 @@ def _draw_status(canvas: np.ndarray, snap: StateSnapshot) -> None:
     else:
         hint = ""
     if hint:
-        _put_text(canvas, hint, (8, 36), _GRAY, 0.4)
+        _put_text(canvas, hint, (8, regions.hint_y), _GRAY, 0.4)
 
 
 _HELP_LINES: tuple[tuple[str, str], ...] = (
@@ -257,7 +325,8 @@ _HELP_LINES: tuple[tuple[str, str], ...] = (
     ("KEYS", ""),
     ("h", "toggle this help"),
     ("1-9", "switch camera (list top-right)"),
-    ("[ ] and ; '", "tune smoothing / responsiveness"),
+    ("[ ] and ; '", "tune cursor smoothing / responsiveness"),
+    ("- = and , .", "tune gesture forgiveness / smoothing"),
     ("p / b / q", "privacy view / control box / quit"),
     ("SAFETY", ""),
     ("touch mouse or type", "gestures suspend instantly"),
@@ -334,18 +403,24 @@ def draw_overlay(
 
     Pure cv2-primitive drawing on the given numpy image — no windows, no
     waitKey — so it is testable headless. ``show_box`` gates the control-box
-    rectangle (the 'b' live-tune key).
+    rectangle (the 'b' live-tune key). ``canvas`` is assumed to be the fixed
+    display size (``cfg.preview.canvas_w/h``); ``lm_frame``'s landmark
+    points are in its OWN original capture size and are rescaled here.
     """
+    h, w = canvas.shape[:2]
+    regions = _compute_regions(w, h)
     if show_box:
         _draw_control_box(canvas, cfg)
     if lm_frame is not None and lm_frame.hand_present:
-        _draw_skeleton(canvas, lm_frame, _state_color(snap))
+        sx = w / lm_frame.img_w if lm_frame.img_w else 1.0
+        sy = h / lm_frame.img_h if lm_frame.img_h else 1.0
+        _draw_skeleton(canvas, lm_frame, _state_color(snap), sx, sy)
     if palm_debug is not None:
         _draw_palm_meter(canvas, palm_debug, cfg)
     _draw_pinch_meters(canvas, pinch_values, cfg)
-    _draw_status(canvas, snap)
+    _draw_status(canvas, snap, regions)
     if cameras:
-        _draw_camera_list(canvas, cameras, current_camera_index, 16)
+        _draw_camera_list(canvas, cameras, current_camera_index, regions.camera_list_top)
     # The guide doubles as the IDLE screen (nothing else to show there), and
     # is toggleable any time with 'h'.
     if show_help or snap.session_state is SessionState.IDLE:
@@ -385,17 +460,12 @@ class Preview:
         draw the on-screen camera picker (press 1-9 to switch); both default
         to None so callers that don't offer switching (replay) need no change.
         """
-        if lm_frame is not None:
-            w, h = lm_frame.img_w, lm_frame.img_h
-        elif bgr_frame is not None:
-            h, w = bgr_frame.shape[:2]
-        else:
-            w, h = self._cfg.camera.width, self._cfg.camera.height
+        cw, ch = self._cfg.preview.canvas_w, self._cfg.preview.canvas_h
 
         if self._cfg.options.privacy_preview or bgr_frame is None:
-            canvas = np.zeros((h, w, 3), dtype=np.uint8)
+            canvas = np.zeros((ch, cw, 3), dtype=np.uint8)
         else:
-            canvas = bgr_frame.copy()  # never draw on the caller's frame
+            canvas = _fit_frame_to_canvas(bgr_frame, cw, ch)
 
         draw_overlay(canvas, lm_frame, snap, pinch_values, self._cfg,
                      show_box=self.show_box, palm_debug=palm_debug,
