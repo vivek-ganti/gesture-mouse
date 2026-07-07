@@ -18,10 +18,19 @@ and install dependencies automatically (needs Python 3.12 on your `PATH` —
 `brew install python@3.12` if you don't have it; the script tells you if it's
 missing); every run after that starts in under a second.
 
-Grant the two permission prompts, then: **hold your index finger up (other
-fingers curled) for ~150 ms** — the corner dot turns green and the cursor is
-yours. Pinch thumb+index to click. Open your palm and swipe to switch Spaces.
-Type or grab the real mouse any time — gestures suspend instantly.
+Grant the two permission prompts. A **control panel opens in your browser**
+(local only — `http://127.0.0.1:8765`): live hand view, per-finger readout,
+camera picker, settings, a gesture editor, and the calibration wizard.
+
+**Calibrate first** (Calibrate tab, ~1 minute): hold six simple poses for a
+few seconds each while the app measures YOUR hand's finger angles and sets
+personal recognition thresholds — this is what makes gestures feel natural
+instead of requiring robot-precise poses.
+
+Then: **hold your index finger up (other fingers curled) for ~150 ms** — the
+corner dot turns green and the cursor is yours. Pinch thumb+index to click.
+Open your palm and swipe to switch Spaces. Type or grab the real mouse any
+time — gestures suspend instantly.
 
 ## Setup
 
@@ -99,43 +108,51 @@ prefer it or the venv is already active in your shell.)
 | `--record FILE` | tee every tracked frame to a JSONL fixture |
 | `--replay FILE` | replay a fixture: prints intents, posts nothing |
 | `--replay-post` | with `--replay`: actually post the replayed intents |
-| `--no-preview` | disable the cv2 tuning window |
-| `--no-privacy` | show the camera image in the preview (default: skeleton on black) |
+| `--panel-port N` | web panel port (default 8765, `config.json → panel`) |
+| `--no-panel` | disable the web panel |
+| `--no-open` | don't auto-open the panel in the browser |
+| `--preview` | ALSO open the cv2 debug window (off by default) |
+| `--no-privacy` | show the camera image in the cv2 debug window |
 | `--debug-gestures` | print swipe arming/candidate/rejection events live |
 
 Hotkeys (global, configurable in `config.json`): **⌃⌥G** toggle IDLE⇄ACTIVE ·
 **⌃⌥Esc** panic → IDLE, releasing all buttons.
 
-Live-tune keys (preview window focused): `[` / `]` cursor mincutoff down/up ·
-`;` / `'` cursor beta down/up · `-` / `=` gesture forgiveness down/up ·
-`,` / `.` gesture smoothing down/up · `b` control-box overlay · `p` privacy
-mode · **`1`-`9` switch camera** · **`h` help/guide overlay** · `q` quit.
-PerfTimer prints per-stage p50/p95 every 5 s.
+## The control panel
 
-The preview window always renders at a fixed size (`config.json → preview`,
-default 960x540) regardless of the camera's actual capture resolution —
-cameras don't reliably honor a requested resolution, so the window would
-otherwise resize or look broken depending on what a given camera delivers.
+`./gesture-mouse` starts a local web panel (printed URL, auto-opened; local
+only — bound to 127.0.0.1, token-guarded, and it NEVER receives camera
+images, only hand-landmark coordinates):
+
+- **Live** — hand skeleton, state, and the per-finger readout: each finger's
+  knuckle angle on a 0–180° track with its curl/extend thresholds marked.
+  If a gesture ever misses, this view shows exactly which finger read wrong
+  and by how much — no more guessing.
+- **Gestures** — built-in gestures as cards, plus YOUR gestures: click Add,
+  hold any pose to the camera for a second, name it, pick what it does
+  (key tap like Option for Wispr Flow dictation, a shell command, or a
+  system action). Collisions with existing gestures are detected up front.
+- **Calibrate** — the wizard that fits recognition to your hand. Run it
+  first; re-run any time lighting/camera changes.
+- **Camera** — click to switch; persisted across restarts.
+- **Settings** — every important threshold as a slider, applied live and
+  saved to config.json.
+
+Closing the tab changes nothing (the app keeps running); reopen the printed
+URL any time.
 
 The corner dot shows state everywhere (incl. fullscreen): gray idle · pulsing
 warmup · white clutch-wait · green pointer · blue pinched · purple scroll ·
 orange palm · yellow hands-lost · red suspended (M/K = mouse/keyboard reason).
 
-### Switching cameras
+### The cv2 debug window (`--preview`)
 
-The preview window (top-right) lists every camera it can see, numbered, with
-the active one marked `*` in green:
-
-```
-[1] FaceTime HD Camera
-[2] Iriun Camera  *
-```
-
-Press the matching digit key to switch — live, mid-session, without
-restarting. If a camera is already open it hot-swaps instantly (falling back
-to the previous one if the new device turns out dead/black); the choice is
-also written to `config.json` so it's remembered next launch. The list
-re-scans for new devices every few seconds.
+The old OpenCV tuning window still exists behind `--preview` (fixed 960x540
+canvas, skeleton + meters). Its live-tune keys: `[` / `]` cursor mincutoff ·
+`;` / `'` cursor beta · `-` / `=` gesture forgiveness (shifts angle
+thresholds, including calibrated per-finger pairs) · `,` / `.` gesture
+smoothing · `b` control-box overlay · `p` privacy · `1`-`9` switch camera ·
+`h` help · `q` quit. PerfTimer prints per-stage p50/p95 every 5 s.
 
 ## Gesture cheat sheet
 
@@ -181,24 +198,34 @@ Bindings for the six system gestures are remappable in `config.json`
 (`bindings`: swipe_left/right/up/down, pinch_in, spread_out → any of
 space_prev, space_next, mission_control, app_expose, launchpad, show_desktop).
 
-## Custom gestures (map a pose to any shortcut)
+## Custom gestures (map any pose to any shortcut)
 
-`config.json → custom_gestures` is a list you can edit, extend, or empty —
-hot-reloaded while running. Each entry: hold the pose (with a mostly-still
-hand) for `hold_ms` and the action fires, then a `cooldown_ms` refractory.
+**Use the panel** (Gestures tab → Add gesture): hold any hand pose to the
+camera for a second — the app captures which fingers are up/down as the
+gesture's signature, warns if it collides with an existing gesture, then you
+name it and pick its action. Saved to `config.json`, live immediately.
+
+A gesture = a per-finger signature (which of index/middle/ring/pinky are
+extended vs curled; the thumb never gates — its hinge reads unreliably) +
+`hold_ms` (hold the pose this long, mostly-still hand) + an action +
+`cooldown_ms` refractory. Built-in poses use the exact same mechanism, so
+captured gestures behave identically to shipped ones.
+
+The JSON stays fully editable by hand (hot-reloaded while running) — and
+it's the only place the `"any"` finger state is available:
 
 ```json
 "custom_gestures": [
   { "name": "dictate", "pose": "horns", "hold_ms": 300,
     "action": { "type": "key", "key": "option" } },
-  { "name": "snaply", "pose": "horns", "hold_ms": 300,
-    "action": { "type": "shell", "argv": ["open", "-a", "Snaply"] } }
+  { "name": "calc",
+    "signature": { "index": "curl", "middle": "ext", "ring": "ext", "pinky": "curl" },
+    "hold_ms": 300,
+    "action": { "type": "shell", "argv": ["open", "-a", "Calculator"] } }
 ]
 ```
 
-Poses available today: `"horns"` 🤘 (index + pinky extended, middle + ring
-curled; thumb ignored) — chosen because it cannot collide with any built-in
-gesture. Action types:
+(The legacy `"pose": "horns"` 🤘 form keeps working.) Action types:
 
 | type | fields | does |
 |---|---|---|
@@ -208,8 +235,7 @@ gesture. Action types:
 
 The ships-by-default example is exactly the dictation case: hold the horns
 sign ~300 ms → Option is tapped → Wispr Flow starts listening. Entries with
-an unknown pose are skipped with a startup warning, never silently. The
-in-app guide (`h`) always lists whatever custom gestures your config defines.
+an invalid signature/unknown pose are skipped with a warning, never silently.
 
 ## Tuning (One Euro, Casiez procedure)
 
@@ -227,7 +253,7 @@ Offline, with a recording:
 .venv/bin/python tools/record.py --seconds 10 --out me.jsonl   # opens camera
 .venv/bin/python tools/tune.py me.jsonl                        # sweep, headless
 .venv/bin/python tools/make_fixture.py all                     # synthetic fixtures
-./gesture-mouse --replay fixtures/click.jsonl --no-preview
+./gesture-mouse --replay fixtures/click.jsonl
 ```
 
 `tools/tune.py` prints jitter_px (RMS motion at rest) and lag_px / lag_ms
@@ -237,28 +263,34 @@ sweeping noiseless synthetic fixtures. Everything hot-reloads: edit
 
 ### If a gesture feels unreliable (misses often, needs an exaggerated pose)
 
-Every finger's extended/curled state comes from the angle at its middle
-(PIP) knuckle — 180° is perfectly straight, 0° is folded flat — smoothed
-first (One Euro, same technique as cursor smoothing) so per-frame camera
-jitter can't flip the reading, then latched with two thresholds instead of
-one (`config.json → pose`: `extend_angle_deg` default 160, `curl_angle_deg`
-default 130) so a finger sitting between the two just keeps whatever state
-it was already in, rather than flickering. Live-tune while testing:
+**Calibrate first** (panel → Calibrate). Every finger's extended/curled
+state comes from the angle at its middle knuckle — 180° is perfectly
+straight, 0° is folded flat — smoothed (One Euro, same technique as cursor
+smoothing) so per-frame camera jitter can't flip the reading, then latched
+with two thresholds so a finger between them keeps its last state instead
+of flickering. The shipped defaults (`pose.extend_angle_deg` 160 /
+`curl_angle_deg` 130) are one-size guesses; the wizard replaces them with
+per-finger values measured from YOUR hand (`config.json → pose.fingers`).
 
-- `-` / `=` make gesture recognition more/less forgiving (widens/narrows how
-  straight a finger must be to read as extended).
-- `,` / `.` make landmark smoothing lighter/heavier (heavier kills more
-  jitter but adds a touch of lag before a gesture registers).
+Then diagnose, don't guess: the panel's Live tab shows each finger's angle
+against its thresholds in real time. Do the failing gesture and watch which
+finger reads wrong — nudge that finger's threshold in Settings (or re-run
+calibration in different lighting).
 
-If gestures still feel unreliable in your lighting/camera after tuning
-those, `pose_jitter_grace_ms` (default 120 ms, `config.json` top level)
-controls how long a pose hold (clutch engage, scroll entry, the four-finger
-open-palm pose) tolerates dropped detection before resetting — raise it a
-bit. `palm.forward_max_speed_px_s` (default 300) caps how fast the cursor
-can be moving for a five-finger pinch/spread to still register while the
-engine hasn't (yet) recognized the four-finger open pose; lower it if
-accidental Launchpad/Show Desktop triggers happen during normal cursor use,
-raise it if a deliberate gesture with a drifting hand gets dropped.
+Still off after that:
+- `pose.smoothing_mincutoff` (Settings slider): heavier smoothing kills
+  more jitter but adds a touch of lag before a gesture registers.
+- `pose_jitter_grace_ms` (default 120 ms): how long a pose hold (clutch
+  engage, scroll entry, open-palm) tolerates dropped detection before
+  resetting — raise it in bad lighting.
+- `palm.forward_max_speed_px_s` (default 300) caps how fast the cursor can
+  be moving for a five-finger pinch/spread to still register; lower it if
+  accidental Launchpad/Show Desktop triggers happen during normal cursor
+  use, raise it if a deliberate gesture with a drifting hand gets dropped.
+- Last resort, record the failing gesture and look at the numbers:
+  `./gesture-mouse --record clip.jsonl`, perform it 5×, then
+  `tools/analyze_recording.py clip.jsonl` prints per-finger angle
+  percentiles against your thresholds.
 
 ## Safety model
 

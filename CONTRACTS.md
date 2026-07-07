@@ -10,8 +10,13 @@ Full product design: `/Users/vivek/.claude/plans/like-how-wispr-flow-peppy-valia
 (gesture rules, thresholds, state machine, invariants — normative).
 
 Global rules:
-- `engine.py`, `palm.py`, `filters.py`, `types.py`: pure logic. No macOS, cv2,
-  mediapipe, or numpy imports. No wall-clock reads — time only from `ts_ms`.
+- `engine.py`, `palm.py`, `filters.py`, `types.py`, `signatures.py`,
+  `calibration.py`: pure logic. No macOS, cv2, mediapipe, or numpy imports.
+  No wall-clock reads — time only from `ts_ms`.
+- `panel.py`: stdlib ONLY (http.server/json/threading/queue/secrets/...) and
+  NO gesture_mouse imports at all — it moves plain dicts. Its server threads
+  touch nothing outside PanelServer's own state; every app effect flows
+  through the command queue drained on the main thread.
 - All temporal logic in milliseconds of `LandmarkFrame.ts_ms`, never frame counts.
 - MediaPipe z is never used anywhere.
 - venv: `.venv/bin/python` (3.12). Test with `.venv/bin/python -m pytest`.
@@ -67,6 +72,109 @@ class LandmarkSmoother:
     def reset(self) -> None
 ```
 
+## signatures.py
+
+```python
+FINGERS = ("index", "middle", "ring", "pinky")   # gate matching
+ALL_FINGERS = ("thumb",) + FINGERS               # sampled/displayed only
+Signature = dict   # finger -> "ext" | "curl" | "any"; missing key == "any"
+FINGER_JOINTS: dict[str, (mcp, pip, tip)]        # thumb uses MCP/IP/TIP
+BUILTINS: dict[str, Signature]                   # pointer/open_palm/scroll/horns
+LEGACY_POSES = {"horns": BUILTINS["horns"]}      # {"pose": "horns"} back-compat
+
+def pip_angle_deg(lm, mcp, pip, tip) -> float    # interior angle: 180=straight, 0=folded
+def compute_finger_angles(lm) -> dict[str, float]   # all five, thumb included
+
+class FingerLatch:                                # two-threshold hysteresis latch
+    extended: bool                                # starts curled
+    def update(self, angle_deg, extend_at, curl_at) -> bool
+    def reset(self) -> None
+
+def normalize_signature(raw) -> Signature | None  # unknown finger/state = invalid;
+                                                  # thumb forced "any"; all-"any" invalid
+def signatures_conflict(a, b) -> bool  # True unless a gating finger separates them
+def check_conflicts(sig, named: dict[str, Signature]) -> list[str]
+def signature_from_states(ext: dict[str, bool]) -> Signature  # capture: 4 fingers, no thumb
+def normalize_custom_entries(entries) -> (parsed, skipped_names)
+    # v2 {name, signature, hold_ms, cooldown_ms, action} AND legacy
+    # {pose: "horns", ...} -> canonical entries; invalid -> skipped, never silent
+```
+
+The ONE definition of "what a pose is": built-in poses and user gestures run
+through the same signature matcher in the engine (engine._match). scroll is
+signature + an engine-side fingertips-together test (`scroll.together_max`) —
+its signature is reserved (a capture matching it is rejected as a conflict).
+
+## calibration.py
+
+```python
+STEPS: tuple[CalibStep, ...]   # pointer, open_palm, scroll, horns, fist, relaxed
+    # CalibStep: id, label, instruction, expected: {finger: "ext"|"curl"|"ignore"}
+    # relaxed = all "ignore" (validation-only: must match NOTHING)
+THUMB_SOURCES = {"open_palm": "ext", "fist": "curl"}   # thumb clusters (advisory)
+
+class CalibrationSession:      # SETTLE_MS=750, TARGET=90, MIN=45, TIMEOUT=15000
+    state: "await_step" | "sampling" | "done"
+    def begin_step(step_id, ts_ms); def add_sample(ts_ms, angles); def cancel()
+    def progress() -> dict     # step/step_i/collected/needed/done_steps/failed_step
+    def compute(defaults, custom_sigs) -> CalibrationResult   # raises unless done
+
+def derive_thresholds(ext, curl, relaxed, defaults, min_gap=15, min_hyst=8) -> FingerResult
+    # NORMATIVE math: ext_low=P10(E), curl_high=P90(C), gap=ext_low-curl_high;
+    # <40 samples either side -> "insufficient"; gap<15 -> "overlap" (keep defaults);
+    # else mid±band/2 with band=min(max(8, 0.3*gap), gap); relaxed nudge: if
+    # P75(R)>=extend, raise extend to min(P75(R)+5, ext_low-3) if it fits, else
+    # "relaxed_overlap"; clamp extend<=178, curl>=2, round 0.1.
+# compute() also VALIDATES: replays each step's samples through fresh
+# FingerLatches at the derived thresholds (own signature >=90% match after a
+# 10-sample warm-up; relaxed matches nothing >=95%, from both latch seeds).
+```
+
+Applied by __main__ on calibrate_apply: per-finger results with status
+ok/relaxed_overlap land in `cfg.pose.fingers[finger] = {extend, curl}`
+(thumb additionally `"advisory": true` — stored, never gates), then
+`store.save()`. Smoothing params are never touched by calibration.
+
+## panel.py
+
+```python
+COMMAND_TYPES  # camera_start/stop/switch, panic, quit, set_setting,
+               # calibrate_start/begin_step/cancel/apply,
+               # capture_start/cancel, save_gesture, delete_gesture
+@dataclass(frozen=True) class PanelCommand: type: str; payload: dict
+
+class PanelServer:
+    def __init__(port, html_path, token=None)   # token auto: secrets.token_urlsafe(16)
+    def start() -> str      # binds 127.0.0.1 (EADDRINUSE -> port 0); daemon thread;
+                            # returns http://127.0.0.1:PORT/?token=...
+    def publish(event, data)     # main thread; serialize once, fan out to per-client
+                                 # bounded queues (32, drop-on-full); "frame" events
+                                 # throttled to >=66ms apart, others always pass
+    def poll_commands() -> list[PanelCommand]    # main loop drains every tick
+    def has_clients() -> bool;  def close()
+
+def frame_event(**primitives) -> dict   # pure SSE "frame" shaper (schema below)
+```
+
+Endpoints: `GET /` = index.html (re-read per request; no token needed);
+`GET /events?token=` = SSE (last "config" event replayed to late joiners,
+then throttled "frame" events; ": ping" keepalives); `POST /command?token=`
+= 202/400/403/413. SECURITY (non-optional — save_gesture carries shell
+argv): 127.0.0.1 bind + per-run URL token + Host-header allowlist
+(127.0.0.1/localhost only, DNS-rebinding guard) checked before routing.
+NO camera image ever crosses the socket — smoothed landmarks only.
+
+"frame" schema (shaped by frame_event): ts, session, engine, hand, fps,
+latency_ms, suspend_reason, img_w/h, landmarks ([[x,y]*21]|null, SMOOTHED —
+the classifier's own input), fingers {finger: {angle, ext}} (thumb ext=null),
+thresholds {finger: {extend, curl, calibrated}}, pinch {left,right},
+pinch_cfg, palm {open, phase, m, disp_frac}, mode, calibration
+(progress()+results|null), capture ({active, signature, stable_ms, done,
+conflicts}|null), toast ({id, level, text}|null, rides ~3s, dedup by id).
+"config" schema: settings (whitelisted dotted paths), custom_gestures
+(normalized), builtin_gestures, cameras, camera_index, calib_defaults,
+calib_steps, pose_fingers.
+
 ## engine.py
 
 ```python
@@ -87,20 +195,31 @@ class GestureEngine:
     def retune_pose_smoothing(self) -> None
         # live-tune: push cfg.pose.smoothing_mincutoff into the already-
         # constructed LandmarkSmoother filters (see __main__.py live-tune keys)
+    def reload_customs(self) -> None
+        # re-parse cfg.custom_gestures WITHOUT a reset (panel save/delete +
+        # config hot-reload); latches/holds/other transients untouched
+    finger_angles: dict[str, float]       # property; smoothed per-finger angles
+                                          # (thumb incl.), {} when no valid hand
+    finger_states: dict[str, bool]        # property; latched ext per gating
+                                          # finger, read WITHOUT updating
+    smoothed_landmarks: tuple[Point, ...] | None   # property; classifier input
 ```
 
-Finger extension (`_ext`, used by every static pose test below) is an
-ANGLE metric, not the old tip-to-wrist ratio: `_pip_angle_deg` computes the
-interior angle at the PIP joint (MCP->PIP vs PIP->TIP vectors; 180 =
-straight/extended, 0 = folded/curled), and a per-finger `_FingerState`
-latches "extended" only above `cfg.pose.extend_angle_deg` and back to
-"curled" only below `cfg.pose.curl_angle_deg` — real hysteresis, mirroring
-the engage/release pattern pinch detection already used, replacing a single
-instant-cutoff boolean. Pose tests run on landmarks pre-smoothed by a
-`LandmarkSmoother` (One Euro per landmark index, `cfg.pose.smoothing_*`) —
-distance-based signals (pinch, scale, anchor-jump, scroll/tab joystick
-deflection) keep using RAW landmarks, since they already have their own,
-better-tuned filters or need unfiltered continuous motion.
+Finger extension (`_ext`) is an ANGLE metric, not the old tip-to-wrist
+ratio: `signatures.pip_angle_deg` computes the interior angle at the PIP
+joint (180 = straight, 0 = folded), and a per-finger `signatures.FingerLatch`
+(engine keeps `_FingerState`/`_pip_angle_deg` aliases) latches "extended" /
+"curled" with real hysteresis — per-finger calibrated thresholds from
+`cfg.pose.fingers[name]` when present, else the global
+`extend_angle_deg`/`curl_angle_deg` pair, read fresh every frame. ALL pose
+tests (built-in and custom) go through ONE generic matcher,
+`_match(signature, lm)`, which updates every gating finger's latch each
+call (FingerLatch.update is idempotent within a frame at a fixed angle, so
+multiple pose tests per frame stay safe). Pose tests run on landmarks
+pre-smoothed by a `LandmarkSmoother` (One Euro per landmark index,
+`cfg.pose.smoothing_*`) — distance-based signals (pinch, scale, anchor-jump,
+scroll/tab joystick deflection) keep using RAW landmarks, since they already
+have their own, better-tuned filters or need unfiltered continuous motion.
 
 Implements (rules + exact thresholds in the plan doc §Gesture vocabulary):
 CLUTCH_WAIT -> pointer-pose 150ms -> POINTER (emit rebase, no cursor jump);
@@ -174,19 +293,26 @@ the detector on entry. pinch_in/spread_out keep their PALM-or-slow-POINTER
 forwarding gate. The anchor-teleport -> HANDS_LOST guard is skipped in PALM
 (a real flick moves the anchor >25% of the frame in one frame).
 
-### Custom gestures (engine + synth, added with the horns/dictate feature)
+### Custom gestures (engine + synth + panel editor)
 
-- Config: `Config.custom_gestures` = list of dicts {name, pose, hold_ms,
-  cooldown_ms, action}. Engine validates at construction; invalid entries go
-  to `engine.custom_skipped` (caller prints a startup warning).
-- Engine: pose registry `_custom_pose_test(pose)` ("horns" = index+pinky
-  extended, middle+ring curled, thumb ignored — collision-free with all
-  built-in poses). Held (debounced) hold_ms with a mostly-still cursor from
+- Config: `Config.custom_gestures` = list of dicts, v2 shape {name,
+  signature: {finger: "ext"|"curl"|"any"}, hold_ms, cooldown_ms, action} or
+  legacy {name, pose: "horns", ...}. Parsed via
+  `signatures.normalize_custom_entries` at engine construction AND on
+  `engine.reload_customs()` (panel save/delete, config hot-reload); invalid
+  entries go to `engine.custom_skipped` (caller prints a warning).
+- Engine: each entry's signature is tested by the same `_match` used by
+  built-in poses. Held (debounced) hold_ms with a mostly-still cursor from
   CLUTCH_WAIT/POINTER, no pinch in flight -> Intent("custom:<name>", TRIGGER,
   {"action": <dict>}) + per-gesture cooldown.
+- Panel editor: capture-by-demonstration (signature_from_states of the live
+  latches, 1s stable, conflict check vs BUILTINS + other customs) -> name +
+  action form -> save_gesture command -> cfg mutation + store.save() +
+  engine.reload_customs(), all on the main thread.
 - Synth: `custom_action_argv(action) -> argv | None` (pure, tested): key taps
   (incl. bare modifiers) via osascript System Events, shell argv, or reuse of
-  a system trigger_command. Fire-and-forget Popen.
+  a system trigger_command. Fire-and-forget Popen. Also the validator the
+  panel save path uses to reject malformed actions.
 
 ## tracker.py
 
@@ -306,16 +432,27 @@ regardless of what scale the OS renders the window at.
 ## __main__.py
 
 argparse: `--list-cameras`, `--camera NAME`, `--config PATH`, `--replay FILE`,
-`--record FILE`, `--no-preview`, `--no-privacy`, `--start-active`.
+`--record FILE`, `--preview` (opt-in cv2 debug window; `--no-preview` is a
+deprecated no-op), `--no-privacy`, `--start-active`, `--panel-port N`,
+`--no-panel`, `--no-open`.
 Flow: preflight permissions (skip for --replay/--list-cameras) -> wiring ->
+panel start (URL printed + browser opened unless --no-open/replay) ->
 session FSM (IDLE camera-off default; toggle/panic via threading.Event from
 hotkeys; WARMUP until first confident frame or 2s; SUSPENDED on guard trip,
-resume only via clutch reacquire or toggle) -> hot loop per Pipeline order ->
-live-tune keys ([ ] mincutoff, ; ' beta, - = pose extend/curl angle
-thresholds, , . pose smoothing mincutoff, b box, p privacy, h help, 1-9
-switch camera, q quit) -> try/finally + atexit -> synth.release_all().
-PerfTimer prints p50/p95 per stage every 5s. Replay mode: no synth posts
-(print intents instead) unless `--replay-post` given.
+resume only via clutch reacquire or toggle) -> hot loop per Pipeline order,
+plus per tick: panel.poll_commands() drained (settings whitelist _SETTINGS;
+calibration/capture mode ownership) and _publish_panel (config event when
+dirty + throttled frame event when clients connected) -> live-tune keys with
+--preview ([ ] mincutoff, ; ' beta, - = pose angles incl. per-finger pairs,
+, . pose smoothing, b box, p privacy, h help, 1-9 camera, q quit) ->
+try/finally + atexit -> synth.release_all() + panel.close().
+`ui_mode` ("normal" | "calibrating" | "capturing"): mode entry does
+release_all + engine.notify_suspended; while non-normal the engine/pipeline
+still tick but guards are SKIPPED and intents are DROPPED (the user is
+deliberately mousing in the browser); mode exit resets the engine and
+re-arms the guards. PerfTimer prints p50/p95 per stage every 5s. Replay
+mode: no synth posts (print intents instead) unless `--replay-post`; the
+panel runs against replay too (camera-free frontend data path).
 
 ## tests/
 
