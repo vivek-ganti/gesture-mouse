@@ -512,6 +512,56 @@ def test_unknown_custom_pose_skipped_and_surfaced():
     assert eng.custom_skipped == ["bad"]
 
 
+def test_v2_signature_custom_gesture_fires():
+    cfg = Config()
+    cfg.custom_gestures = [{
+        "name": "rock",
+        "signature": {"index": "ext", "middle": "curl", "ring": "curl", "pinky": "ext"},
+        "hold_ms": 300.0, "cooldown_ms": 1200.0,
+        "action": {"type": "key", "key": "option"},
+    }]
+    s = Seq(pose="horns")
+    s.hold("horns", 600)
+    intents, _, _ = run(s.frames, cfg=cfg)
+    fired = named(intents, "custom:rock")
+    assert len(fired) == 1
+    assert fired[0].payload["action"] == {"type": "key", "key": "option"}
+
+
+def test_reload_customs_picks_up_new_entry_without_reset():
+    cfg = Config()
+    pipe = CursorPipeline(cfg, *SCREEN)
+    eng = GestureEngine(cfg, pipe.pinch)
+    assert [g["name"] for g in eng._custom] == ["dictate"]
+    latch = eng._latches["index"]
+    cfg.custom_gestures.append({
+        "name": "added",
+        "signature": {"middle": "ext", "ring": "ext", "index": "curl", "pinky": "curl"},
+        "action": {"type": "shell", "argv": ["true"]},
+    })
+    eng.reload_customs()
+    assert [g["name"] for g in eng._custom] == ["dictate", "added"]
+    assert eng._latches["index"] is latch  # transient state untouched
+
+
+def test_finger_angles_exact_on_first_frame_and_cleared_on_loss():
+    from pose_fixtures import make_bent_frame
+    from helpers import lost_frame
+    from gesture_mouse.types import CursorSample
+
+    cfg = Config()
+    pipe = CursorPipeline(cfg, *SCREEN)
+    eng = GestureEngine(cfg, pipe.pinch)
+    frame = make_bent_frame(0.0, {"index": 90.0, "middle": 180.0, "ring": 45.0, "pinky": 0.0})
+    eng.update(frame, pipe.update(frame))
+    # OneEuro first-sample passthrough makes frame-1 angles exact.
+    assert eng.finger_angles["index"] == pytest.approx(90.0)
+    assert eng.finger_angles["middle"] == pytest.approx(180.0)
+    lost = lost_frame(STEP_MS)
+    eng.update(lost, pipe.update(lost))
+    assert eng.finger_angles == {}
+
+
 # -- angle-based pose classification (plan doc: gesture reliability) --------
 #
 # _pip_angle_deg/_FingerState replaced a single hard-cutoff ratio test with

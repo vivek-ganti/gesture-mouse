@@ -32,26 +32,17 @@ that requires ``clutch.reacquire_ms`` of pointer pose.
 """
 from __future__ import annotations
 
-import math
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
+from . import signatures
 from .config import Config
 from .filters import LandmarkSmoother
 from .types import (
     INDEX_MCP,
-    INDEX_PIP,
     INDEX_TIP,
-    MIDDLE_MCP,
-    MIDDLE_PIP,
     MIDDLE_TIP,
-    PINKY_MCP,
-    PINKY_PIP,
-    PINKY_TIP,
-    RING_MCP,
-    RING_PIP,
-    RING_TIP,
     THUMB_TIP,
     CursorSample,
     EngineState,
@@ -138,45 +129,11 @@ class _Debounced:
         self._false_since = None
 
 
-def _pip_angle_deg(lm: tuple[Point, ...], mcp: int, pip: int, tip: int) -> float:
-    """Interior angle at the PIP joint, degrees: 180 = perfectly straight
-    (MCP, PIP, TIP colinear), shrinking toward 0 as the finger curls back on
-    itself. Scale/rotation invariant (unlike a tip-to-wrist distance ratio,
-    which is sensitive to hand tilt/yaw toward the camera) — replaces the
-    old radial extension test (plan doc: gesture reliability research)."""
-    ax, ay = lm[mcp].x - lm[pip].x, lm[mcp].y - lm[pip].y  # PIP -> MCP
-    bx, by = lm[tip].x - lm[pip].x, lm[tip].y - lm[pip].y  # PIP -> TIP
-    na, nb = math.hypot(ax, ay), math.hypot(bx, by)
-    if na <= 1e-9 or nb <= 1e-9:
-        return 180.0  # degenerate (coincident points): treat as straight
-    cos_a = max(-1.0, min(1.0, (ax * bx + ay * by) / (na * nb)))
-    return math.degrees(math.acos(cos_a))
-
-
-class _FingerState:
-    """Two-threshold hysteresis latch for one finger's extended/curled
-    state (plan doc: gesture reliability research), replacing a single
-    hard-cutoff ratio test. Mirrors the engage/release pattern already used
-    for pinch detection: a finger only becomes "extended" once its PIP
-    angle clears the (high) extend threshold, and only reverts to "curled"
-    once it drops below the (lower) curl threshold — a finger sitting
-    between the two stays whatever it last was, instead of flickering every
-    frame the way a single instant cutoff does."""
-
-    __slots__ = ("extended",)
-
-    def __init__(self) -> None:
-        self.extended = False
-
-    def update(self, angle_deg: float, extend_at: float, curl_at: float) -> bool:
-        if self.extended and angle_deg <= curl_at:
-            self.extended = False
-        elif not self.extended and angle_deg >= extend_at:
-            self.extended = True
-        return self.extended
-
-    def reset(self) -> None:
-        self.extended = False
+# Angle metric + hysteresis latch live in signatures.py (the shared "what a
+# pose is" module); re-exported under their original names because tests and
+# CONTRACTS.md reference them here.
+_pip_angle_deg = signatures.pip_angle_deg
+_FingerState = signatures.FingerLatch
 
 
 class GestureEngine:
@@ -210,10 +167,10 @@ class GestureEngine:
         # rather than carrying stale filter/latch state from the old hand.
         self._smoother = LandmarkSmoother(self.cfg)
         self._lm_smooth: tuple[Point, ...] | None = None
-        self._finger_index = _FingerState()
-        self._finger_middle = _FingerState()
-        self._finger_ring = _FingerState()
-        self._finger_pinky = _FingerState()
+        self._finger_angles: dict[str, float] = {}
+        self._latches: dict[str, signatures.FingerLatch] = {
+            f: signatures.FingerLatch() for f in signatures.FINGERS
+        }
         self._cursor_hist: deque[tuple[float, float, float]] = deque()
         self._scale_hist: deque[tuple[float, float]] = deque()
         self._last_ts: float | None = None
@@ -253,28 +210,9 @@ class GestureEngine:
         self._open_palm_hold = _Debounced(grace)
         self._last_open_palm: bool = False   # for the palm_debug readout
         # Custom gestures: per-entry debounced pose hold + cooldown. Entries
-        # with an unknown pose/missing action are skipped, surfaced via
-        # custom_skipped so the caller can warn at startup, never silently.
-        self._custom: list[dict] = []
-        self.custom_skipped: list[str] = []
-        for entry in getattr(self.cfg, "custom_gestures", []) or []:
-            if not isinstance(entry, dict):
-                self.custom_skipped.append(str(entry))
-                continue
-            pose = str(entry.get("pose", ""))
-            name = str(entry.get("name", pose or "custom"))
-            if self._custom_pose_test(pose) is None or not entry.get("action"):
-                self.custom_skipped.append(name)
-                continue
-            self._custom.append({
-                "name": name,
-                "pose": pose,
-                "hold_ms": float(entry.get("hold_ms", 300.0)),
-                "cooldown_ms": float(entry.get("cooldown_ms", 1200.0)),
-                "action": dict(entry["action"]),
-                "hold": _Debounced(grace),
-                "block_until": float("-inf"),
-            })
+        # with an invalid signature/unknown pose/missing action are skipped,
+        # surfaced via custom_skipped so the caller can warn, never silently.
+        self._parse_customs()
         # Hands lost.
         self._lost_since: float | None = None
         self._reacquire_hold = _Debounced(grace)
@@ -301,6 +239,26 @@ class GestureEngine:
         reads them straight from ``cfg.pose`` every frame."""
         self._smoother.set_mincutoff(self.cfg.pose.smoothing_mincutoff)
 
+    def _parse_customs(self) -> None:
+        grace = self.cfg.pose_jitter_grace_ms
+        parsed, self.custom_skipped = signatures.normalize_custom_entries(
+            getattr(self.cfg, "custom_gestures", []) or []
+        )
+        self._custom = [
+            {**g, "hold": _Debounced(grace), "block_until": float("-inf")}
+            for g in parsed
+        ]
+
+    def reload_customs(self) -> None:
+        """Re-parse ``cfg.custom_gestures`` WITHOUT a full reset — used when
+        the panel (or an external config.json edit) adds/edits/deletes a
+        gesture mid-session. Latches, pose holds and all other transient
+        state stay untouched; only the custom-gesture table is rebuilt (so
+        an in-flight hold on a surviving gesture restarts, which is the
+        conservative behavior for an entry whose definition may just have
+        changed)."""
+        self._parse_customs()
+
     @property
     def pinch_values(self) -> dict[str, float]:
         """Latest filtered pinch distances for the preview meters (additive to
@@ -312,6 +270,31 @@ class GestureEngine:
         if self._right_val != inf:
             out["right"] = self._right_val
         return out
+
+    @property
+    def smoothed_landmarks(self) -> tuple[Point, ...] | None:
+        """The pre-smoothed landmark set the pose classifier saw on the last
+        frame, or None when no valid hand (additive to the CONTRACTS.md
+        surface). The panel streams THESE, not the raw landmarks — its live
+        view exists to answer "why isn't this registering," so it must show
+        the classifier's input."""
+        return self._lm_smooth
+
+    @property
+    def finger_angles(self) -> dict[str, float]:
+        """Latest per-finger joint angles (degrees, thumb included) from the
+        SMOOTHED landmarks — i.e. exactly the signal the pose classifier
+        sees (additive to the CONTRACTS.md surface). Empty dict when the
+        last frame had no valid hand. This is the calibration wizard's
+        sampling tap and the panel's live per-finger readout."""
+        return dict(self._finger_angles)
+
+    @property
+    def finger_states(self) -> dict[str, bool]:
+        """Current latched extended/curled state per gating finger, read
+        WITHOUT updating the latches (additive to the CONTRACTS.md surface).
+        Feeds the panel readout and the capture-by-demonstration flow."""
+        return {f: latch.extended for f, latch in self._latches.items()}
 
     @property
     def palm_debug(self) -> dict[str, float | bool | str]:
@@ -330,28 +313,47 @@ class GestureEngine:
 
     # -- pose tests ---------------------------------------------------------
 
-    def _ext(
-        self, finger: _FingerState, lm: tuple[Point, ...], mcp: int, pip: int, tip: int
-    ) -> bool:
+    def _finger_thresholds(self, name: str) -> tuple[float, float]:
+        """(extend_at, curl_at) for one finger: per-finger calibrated values
+        from ``cfg.pose.fingers`` when present (written by the calibration
+        wizard), else the global pair. Read fresh every frame so both the
+        panel's sliders and the wizard's Apply take effect immediately."""
+        per = self.cfg.pose.fingers.get(name)
+        if isinstance(per, dict) and "extend" in per and "curl" in per:
+            return float(per["extend"]), float(per["curl"])
+        return self.cfg.pose.extend_angle_deg, self.cfg.pose.curl_angle_deg
+
+    def _ext(self, name: str, lm: tuple[Point, ...]) -> bool:
+        mcp, pip, tip = signatures.FINGER_JOINTS[name]
         if self.cfg.options.extended_test == "y":
             # Mirrored frame is y-down: an extended (upward-pointing) finger
             # has its tip above its PIP. Config alternative for camera-down
             # geometry where the PIP-angle test's perspective compresses.
             return lm[tip].y < lm[pip].y
-        p = self.cfg.pose
-        angle = _pip_angle_deg(lm, mcp, pip, tip)
-        return finger.update(angle, p.extend_angle_deg, p.curl_angle_deg)
+        angle = signatures.pip_angle_deg(lm, mcp, pip, tip)
+        extend_at, curl_at = self._finger_thresholds(name)
+        return self._latches[name].update(angle, extend_at, curl_at)
+
+    def _match(self, sig: signatures.Signature, lm: tuple[Point, ...]) -> bool:
+        """Generic signature matcher — the ONE code path shared by built-in
+        poses and user-defined gestures. Evaluates every gating finger's
+        latch each call (keeps all four latches fresh, mirroring the old
+        behavior where each pose test touched all four fingers;
+        ``FingerLatch.update`` is idempotent within a frame at a fixed
+        angle, so multiple pose tests per frame remain safe)."""
+        states = {f: self._ext(f, lm) for f in signatures.FINGERS}
+        for finger, want in sig.items():
+            if finger not in states or want == "any":
+                continue  # thumb / "any": never gates
+            if states[finger] != (want == "ext"):
+                return False
+        return True
 
     def _index_extended(self, lm: tuple[Point, ...]) -> bool:
-        return self._ext(self._finger_index, lm, INDEX_MCP, INDEX_PIP, INDEX_TIP)
+        return self._ext("index", lm)
 
     def _pointer_pose(self, lm: tuple[Point, ...]) -> bool:
-        return (
-            self._ext(self._finger_index, lm, INDEX_MCP, INDEX_PIP, INDEX_TIP)
-            and not self._ext(self._finger_middle, lm, MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP)
-            and not self._ext(self._finger_ring, lm, RING_MCP, RING_PIP, RING_TIP)
-            and not self._ext(self._finger_pinky, lm, PINKY_MCP, PINKY_PIP, PINKY_TIP)
-        )
+        return self._match(signatures.BUILTINS["pointer"], lm)
 
     def _open_palm_pose(self, lm: tuple[Point, ...]) -> bool:
         """Four fingers extended — deliberately EXCLUDES the thumb.
@@ -367,36 +369,17 @@ class GestureEngine:
         already read the thumb through the continuous spread metric in
         palm.py, which has no such failure mode.
         """
-        return (
-            self._ext(self._finger_index, lm, INDEX_MCP, INDEX_PIP, INDEX_TIP)
-            and self._ext(self._finger_middle, lm, MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP)
-            and self._ext(self._finger_ring, lm, RING_MCP, RING_PIP, RING_TIP)
-            and self._ext(self._finger_pinky, lm, PINKY_MCP, PINKY_PIP, PINKY_TIP)
-        )
+        return self._match(signatures.BUILTINS["open_palm"], lm)
 
     def _horns_pose(self, lm: tuple[Point, ...]) -> bool:
         """Rock sign 🤘: index + pinky extended, middle + ring curled. Thumb
         ignored (unreliable). Mutually exclusive with pointer (pinky curled
         there), scroll (middle extended there) and open-palm (middle+ring
         extended there) — so it can't collide with any built-in gesture."""
-        return (
-            self._ext(self._finger_index, lm, INDEX_MCP, INDEX_PIP, INDEX_TIP)
-            and self._ext(self._finger_pinky, lm, PINKY_MCP, PINKY_PIP, PINKY_TIP)
-            and not self._ext(self._finger_middle, lm, MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP)
-            and not self._ext(self._finger_ring, lm, RING_MCP, RING_PIP, RING_TIP)
-        )
-
-    # Pose name -> test method; extend here when adding new custom poses.
-    def _custom_pose_test(self, pose: str):
-        return {"horns": self._horns_pose}.get(pose)
+        return self._match(signatures.BUILTINS["horns"], lm)
 
     def _scroll_pose(self, lm: tuple[Point, ...], scale: float) -> bool:
-        if not (
-            self._ext(self._finger_index, lm, INDEX_MCP, INDEX_PIP, INDEX_TIP)
-            and self._ext(self._finger_middle, lm, MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP)
-            and not self._ext(self._finger_ring, lm, RING_MCP, RING_PIP, RING_TIP)
-            and not self._ext(self._finger_pinky, lm, PINKY_MCP, PINKY_PIP, PINKY_TIP)
-        ):
+        if not self._match(signatures.BUILTINS["scroll"], lm):
             return False
         return dist(lm[INDEX_TIP], lm[MIDDLE_TIP]) / scale < self.cfg.scroll.together_max
 
@@ -516,6 +499,7 @@ class GestureEngine:
         open_palm = False
         anchor: Point | None = None
         self._lm_smooth = None
+        self._finger_angles = {}
 
         if valid:
             lm_raw = frame.landmarks
@@ -530,6 +514,7 @@ class GestureEngine:
             self._lm_smooth = self._smoother.smooth(frame)
             lm = self._lm_smooth
             assert lm is not None
+            self._finger_angles = signatures.compute_finger_angles(lm)
             anchor = lm_raw[INDEX_MCP]
             open_palm = self._open_palm_pose(lm)
             self._left_val = self._pinch_filter(
@@ -611,8 +596,7 @@ class GestureEngine:
             lm = self._lm_smooth
             assert lm is not None
             for g in self._custom:
-                test = self._custom_pose_test(g["pose"])
-                since = g["hold"].update(ts, bool(test and test(lm)))
+                since = g["hold"].update(ts, self._match(g["signature"], lm))
                 if (
                     since is not None
                     and ts - since >= g["hold_ms"]

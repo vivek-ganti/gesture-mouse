@@ -27,29 +27,18 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
 
+from gesture_mouse import signatures  # noqa: E402
 from gesture_mouse.config import ConfigStore  # noqa: E402
 from gesture_mouse.engine import GestureEngine  # noqa: E402
 from gesture_mouse.filters import CursorPipeline  # noqa: E402
 from gesture_mouse.palm import PalmDetector  # noqa: E402
 from gesture_mouse.tracker import ReplayTracker  # noqa: E402
 from gesture_mouse.types import (  # noqa: E402
-    INDEX_PIP,
     INDEX_TIP,
-    MIDDLE_PIP,
     MIDDLE_TIP,
-    PINKY_PIP,
-    PINKY_TIP,
-    RING_PIP,
-    RING_TIP,
     THUMB_TIP,
-    WRIST,
     dist,
 )
-
-
-def _ext(lm, tip, pip) -> bool:
-    w = lm[WRIST]
-    return dist(lm[tip], w) > 1.15 * dist(lm[pip], w)
 
 
 def main() -> int:
@@ -71,6 +60,7 @@ def main() -> int:
     scales: list[float] = []
     hands: Counter[str] = Counter()
     poses = Counter()
+    finger_angles: dict[str, list[float]] = {f: [] for f in signatures.ALL_FINGERS}
     min_left = min_right = float("inf")
     intents: list = []
     first_ts = last_ts = None
@@ -103,10 +93,20 @@ def main() -> int:
             scales.append(frame.scale)
             hands[frame.handedness or "?"] += 1
             lm = frame.landmarks
-            idx = _ext(lm, INDEX_TIP, INDEX_PIP)
-            mid = _ext(lm, MIDDLE_TIP, MIDDLE_PIP)
-            rng = _ext(lm, RING_TIP, RING_PIP)
-            pky = _ext(lm, PINKY_TIP, PINKY_PIP)
+            # Same angle metric the live classifier uses (interior joint
+            # angle, 180=straight); per-frame instant thresholds here (no
+            # hysteresis latch) — this is a rough census, not the engine.
+            angles = signatures.compute_finger_angles(lm)
+            for f in signatures.ALL_FINGERS:
+                finger_angles[f].append(angles[f])
+            ext_at = cfg.pose.extend_angle_deg
+            per = cfg.pose.fingers
+            def _is_ext(f: str) -> bool:
+                th = per.get(f)
+                at = float(th["extend"]) if isinstance(th, dict) and "extend" in th else ext_at
+                return angles[f] >= at
+            idx, mid = _is_ext("index"), _is_ext("middle")
+            rng, pky = _is_ext("ring"), _is_ext("pinky")
             if idx and not mid and not rng and not pky:
                 poses["pointer"] += 1
             if idx and mid and rng and pky:
@@ -129,7 +129,35 @@ def main() -> int:
               f"median {statistics.median(confs):.2f}  min {min(confs):.2f}")
         print(f"hand scale px: mean {statistics.mean(scales):.0f}  "
               f"range {min(scales):.0f}-{max(scales):.0f}")
-    print("\n=== POSES (frames matched) ===")
+    print("\n=== FINGER ANGLES (deg; 180=straight, 0=folded) ===")
+    if any(finger_angles.values()):
+        print(f"{'finger':7s} {'p10':>6s} {'p25':>6s} {'p50':>6s} "
+              f"{'p75':>6s} {'p90':>6s}   thresholds (curl/extend)")
+        for f in signatures.ALL_FINGERS:
+            vals = sorted(finger_angles[f])
+            if not vals:
+                continue
+            def pq(q: float) -> float:
+                i = q * (len(vals) - 1)
+                lo, hi = int(i), min(int(i) + 1, len(vals) - 1)
+                return vals[lo] + (vals[hi] - vals[lo]) * (i - lo)
+            th = cfg.pose.fingers.get(f)
+            if isinstance(th, dict) and "extend" in th:
+                th_txt = f"{th['curl']:.0f}/{th['extend']:.0f} (calibrated)"
+            elif f == "thumb":
+                th_txt = "- (never gates)"
+            else:
+                th_txt = (f"{cfg.pose.curl_angle_deg:.0f}/"
+                          f"{cfg.pose.extend_angle_deg:.0f} (global default)")
+            print(f"{f:7s} {pq(.10):6.1f} {pq(.25):6.1f} {pq(.50):6.1f} "
+                  f"{pq(.75):6.1f} {pq(.90):6.1f}   {th_txt}")
+        print("A finger reads EXTENDED above the extend threshold and CURLED "
+              "below the curl threshold; if a gesture misses, look for its "
+              "cluster sitting on the wrong side.")
+    else:
+        print("(no hand frames)")
+
+    print("\n=== POSES (frames matched, instant per-frame census) ===")
     print(f"pointer(index only): {poses['pointer']}   "
           f"open_palm(4-finger, thumb ignored): {poses['open_palm']}   "
           f"scroll(index+middle): {poses['scroll(2-finger)']}")

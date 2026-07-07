@@ -31,9 +31,12 @@ import signal
 import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
 
-from . import permissions
+from . import permissions, signatures
+from .calibration import STEPS as CALIB_STEPS
+from .calibration import CalibrationResult, CalibrationSession
 from .config import ConfigStore
 from .engine import EngineOutput, GestureEngine
 from .filters import CursorPipeline
@@ -41,8 +44,9 @@ from .guards import Guards
 from .hotkeys import pump_events, register_hotkeys
 from .indicator import Indicator
 from .palm import PalmDetector
+from .panel import PanelCommand, PanelServer, frame_event
 from .preview import Preview
-from .synth import Synth, real_cursor_pos, screen_size
+from .synth import Synth, custom_action_argv, real_cursor_pos, screen_size
 from .tracker import CameraTracker, Recorder, ReplayTracker, bench_cameras, list_cameras
 from .types import EngineState, Intent, LandmarkFrame, Phase, SessionState, StateSnapshot
 
@@ -60,6 +64,33 @@ _BETA_STEP = 1.5           # ; ' multiplicative step for beta
 _POSE_SMOOTH_STEP = 1.25   # , . multiplicative step for pose smoothing mincutoff
 _ANGLE_STEP = 5.0          # - = additive step (deg) for pose extend/curl thresholds
 _MIN_ANGLE_GAP = 5.0       # keep curl_angle_deg clearly below extend_angle_deg
+_CAPTURE_STABLE_MS = 1000.0   # pose must hold this long to freeze a capture
+_CAPTURE_TIMEOUT_S = 20.0     # capture mode auto-cancels after this
+_TOAST_TTL_S = 3.0            # a toast rides frame events this long (dedup by id)
+
+# Panel set_setting whitelist: dotted config path -> (min, max, kind).
+# kind: "bool" toggles; "filter"/"pose" additionally re-apply live tuning
+# (same callbacks the keyboard live-tune keys use); None = plain clamp+set.
+# Anything not listed here is NOT settable from the browser — the panel is
+# localhost-only and token-guarded, but shell-reachable surface still stays
+# minimal by construction.
+_SETTINGS: dict[str, tuple[float, float, str | None]] = {
+    "pose.extend_angle_deg": (100.0, 178.0, "pose"),
+    "pose.curl_angle_deg": (2.0, 150.0, "pose"),
+    "pose.smoothing_mincutoff": (0.1, 20.0, "pose"),
+    "pose_jitter_grace_ms": (0.0, 500.0, None),
+    "pinch.left_engage": (0.05, 1.0, None),
+    "pinch.left_release": (0.05, 1.2, None),
+    "pinch.right_engage": (0.05, 1.0, None),
+    "pinch.right_release": (0.05, 1.2, None),
+    "scroll.gain": (10.0, 2000.0, None),
+    "scroll.together_max": (0.1, 1.0, None),
+    "scroll.invert": (0.0, 1.0, "bool"),
+    "one_euro.mincutoff": (0.05, 20.0, "filter"),
+    "one_euro.beta": (0.00005, 1.0, "filter"),
+    "palm.forward_max_speed_px_s": (30.0, 1500.0, None),
+    "options.privacy_preview": (0.0, 1.0, "bool"),
+}
 
 
 class PerfTimer:
@@ -129,10 +160,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
                     help="replay a JSONL fixture instead of opening a camera")
     ap.add_argument("--record", metavar="FILE",
                     help="tee every tracked frame to a JSONL fixture")
+    ap.add_argument("--preview", action="store_true",
+                    help="open the cv2 debug window (the web panel is the primary UI)")
     ap.add_argument("--no-preview", action="store_true",
-                    help="disable the cv2 tuning window")
+                    help=argparse.SUPPRESS)  # deprecated no-op: off is the default now
     ap.add_argument("--no-privacy", action="store_true",
-                    help="show the camera image in the preview (default: skeleton on black)")
+                    help="show the camera image in the cv2 debug window "
+                         "(default: skeleton on black; the web panel never shows images)")
+    ap.add_argument("--panel-port", type=int, metavar="N",
+                    help="web control panel port (default: config panel.port, 8765)")
+    ap.add_argument("--no-panel", action="store_true",
+                    help="disable the web control panel entirely")
+    ap.add_argument("--no-open", action="store_true",
+                    help="don't auto-open the panel in the browser")
     ap.add_argument("--start-active", action="store_true",
                     help="open the camera immediately instead of waiting for the toggle hotkey")
     ap.add_argument("--debug-gestures", action="store_true",
@@ -169,7 +209,12 @@ class App:
         self.guards: Guards | None = (
             Guards(self.cfg.suspend, self.synth) if self.synth is not None else None
         )
-        self.preview: Preview | None = None if args.no_preview else Preview(self.cfg)
+        # cv2 window is opt-in since the web panel became the primary UI;
+        # --no-preview is accepted as a deprecated no-op.
+        if args.no_preview:
+            print("[deprecated] --no-preview is now the default; "
+                  "use --preview to open the cv2 debug window")
+        self.preview: Preview | None = Preview(self.cfg) if args.preview else None
         self.indicator: Indicator | None = None if self.replay_mode else Indicator()
         self.tracker: CameraTracker | ReplayTracker | None = None
         self.recorder: Recorder | None = None
@@ -320,20 +365,28 @@ class App:
         elif ch == "'":
             oe.beta = min(1.0, max(oe.beta, 1e-5) * _BETA_STEP)
             self._apply_filter_tuning(f"beta={oe.beta:.5f}")
-        elif ch == "-":
-            # More forgiving: a finger needs less straightening to read as
-            # "extended" and less curling to read as "curled" (plan doc:
-            # gesture reliability — these are the angle-hysteresis
-            # thresholds that replaced the old single ratio cutoff).
-            p.extend_angle_deg = max(p.curl_angle_deg + _MIN_ANGLE_GAP,
-                                      p.extend_angle_deg - _ANGLE_STEP)
-            p.curl_angle_deg = max(0.0, p.curl_angle_deg - _ANGLE_STEP)
-            print(f"[tune] pose extend={p.extend_angle_deg:.0f} curl={p.curl_angle_deg:.0f}")
-        elif ch == "=":
-            p.extend_angle_deg = min(180.0, p.extend_angle_deg + _ANGLE_STEP)
-            p.curl_angle_deg = min(p.extend_angle_deg - _MIN_ANGLE_GAP,
-                                    p.curl_angle_deg + _ANGLE_STEP)
-            print(f"[tune] pose extend={p.extend_angle_deg:.0f} curl={p.curl_angle_deg:.0f}")
+        elif ch in ("-", "="):
+            # More forgiving (-) / stricter (=): shift the angle-hysteresis
+            # thresholds. Applies to the per-finger CALIBRATED pairs too when
+            # present — otherwise calibration would silently make these keys
+            # inert for calibrated fingers.
+            delta = -_ANGLE_STEP if ch == "-" else _ANGLE_STEP
+            if ch == "-":
+                p.extend_angle_deg = max(p.curl_angle_deg + _MIN_ANGLE_GAP,
+                                          p.extend_angle_deg + delta)
+                p.curl_angle_deg = max(0.0, p.curl_angle_deg + delta)
+            else:
+                p.extend_angle_deg = min(180.0, p.extend_angle_deg + delta)
+                p.curl_angle_deg = min(p.extend_angle_deg - _MIN_ANGLE_GAP,
+                                        p.curl_angle_deg + delta)
+            for name, th in p.fingers.items():
+                if isinstance(th, dict) and "extend" in th and "curl" in th:
+                    th["extend"] = max(2.0, min(180.0, float(th["extend"]) + delta))
+                    th["curl"] = max(0.0, min(th["extend"] - _MIN_ANGLE_GAP,
+                                              float(th["curl"]) + delta))
+            per = ("  (+ per-finger calibrated pairs)" if p.fingers else "")
+            print(f"[tune] pose extend={p.extend_angle_deg:.0f} "
+                  f"curl={p.curl_angle_deg:.0f}{per}")
         elif ch == ",":
             p.smoothing_mincutoff = max(0.1, p.smoothing_mincutoff / _POSE_SMOOTH_STEP)
             self._apply_pose_tuning(f"pose smoothing mincutoff={p.smoothing_mincutoff:.3f}")

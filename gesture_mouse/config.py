@@ -180,9 +180,25 @@ class PoseConfig:
 
     extend_angle_deg: float = 160.0
     curl_angle_deg: float = 130.0
+    # Per-finger calibrated thresholds, written by the calibration wizard:
+    # {"index": {"extend": 158.0, "curl": 121.0}, ...}. A finger absent here
+    # falls back to the global pair above; empty dict = uncalibrated (the
+    # default, and the shape every pre-calibration config.json has). The
+    # thumb's entry additionally carries "advisory": true — it is stored for
+    # future thumb-aware signatures but NEVER gates classification.
+    fingers: dict = field(default_factory=dict)
     smoothing_mincutoff: float = 1.5
     smoothing_beta: float = 0.02
     smoothing_dcutoff: float = 1.0
+
+
+@dataclass
+class PanelConfig:
+    """Local web control panel (the app's primary UI): served in-process on
+    127.0.0.1 only; the printed URL carries a per-run access token."""
+
+    port: int = 8765
+    open_browser: bool = True
 
 
 @dataclass
@@ -255,6 +271,7 @@ class Config:
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     preview: PreviewConfig = field(default_factory=PreviewConfig)
     pose: PoseConfig = field(default_factory=PoseConfig)
+    panel: PanelConfig = field(default_factory=PanelConfig)
     suspend: SuspendConfig = field(default_factory=SuspendConfig)
     hands_lost_ms: float = 265.0
     # Pose holds (clutch engage, scroll entry, PALM entry/exit) tolerate up to
