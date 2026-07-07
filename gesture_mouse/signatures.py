@@ -194,14 +194,28 @@ def normalize_custom_entries(entries: list) -> tuple[list[dict], list[str]]:
             sig = LEGACY_POSES.get(pose)
         else:
             sig = None
-        if sig is None or not entry.get("action"):
+        action = entry.get("action")
+        if sig is None or not isinstance(action, dict) or not action:
+            skipped.append(name)
+            continue
+        # Coercion failures (junk strings, JSON NaN/Infinity — json.loads
+        # accepts both, and non-finite floats would poison config.json and
+        # the panel's SSE stream) skip like any other invalid entry: this
+        # parser must NEVER raise, whatever a hand-edited config contains.
+        try:
+            hold_ms = float(entry.get("hold_ms", 300.0))
+            cooldown_ms = float(entry.get("cooldown_ms", 1200.0))
+        except (TypeError, ValueError):
+            skipped.append(name)
+            continue
+        if not (math.isfinite(hold_ms) and math.isfinite(cooldown_ms)):
             skipped.append(name)
             continue
         parsed.append({
             "name": name,
             "signature": dict(sig),
-            "hold_ms": float(entry.get("hold_ms", 300.0)),
-            "cooldown_ms": float(entry.get("cooldown_ms", 1200.0)),
-            "action": dict(entry["action"]),
+            "hold_ms": hold_ms,
+            "cooldown_ms": cooldown_ms,
+            "action": dict(action),
         })
     return parsed, skipped

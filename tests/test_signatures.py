@@ -144,6 +144,23 @@ class TestNormalizeCustomEntries:
         assert parsed == []
         assert skipped == ["not-a-dict", "bad-pose", "no-action", "bad-sig"]
 
+    def test_malformed_numbers_and_nonfinite_skip_instead_of_raising(self):
+        # json.loads accepts NaN/Infinity and "1e999" -> inf; a hand-edited
+        # config must never crash the parser (CONTRACTS: skipped, not raised)
+        # nor smuggle non-finite floats into config.json / the SSE stream.
+        parsed, skipped = normalize_custom_entries([
+            {"name": "junk-hold", "signature": {"index": "ext"},
+             "hold_ms": "not-a-number", "action": dict(self.ACTION)},
+            {"name": "nan-hold", "signature": {"index": "ext"},
+             "hold_ms": float("nan"), "action": dict(self.ACTION)},
+            {"name": "inf-cool", "signature": {"index": "ext"},
+             "cooldown_ms": float("inf"), "action": dict(self.ACTION)},
+            {"name": "action-not-dict", "signature": {"index": "ext"},
+             "action": "open -a Calculator"},
+        ])
+        assert parsed == []
+        assert skipped == ["junk-hold", "nan-hold", "inf-cool", "action-not-dict"]
+
 
 class TestSignatureFromStates:
     def test_pins_all_four_gating_fingers(self):

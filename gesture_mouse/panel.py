@@ -71,6 +71,10 @@ _FINGER_ORDER: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
 
 _ALLOWED_HOSTNAMES: frozenset[str] = frozenset({"127.0.0.1", "localhost"})
 
+
+def _reject_constant(name: str):
+    raise ValueError(f"non-finite JSON constant {name!r} rejected")
+
 _FALLBACK_HTML: bytes = (
     b"<!doctype html><meta charset='utf-8'><title>gesture-mouse</title>"
     b"<p>panel.html not found; the panel server is running but has no UI "
@@ -213,7 +217,13 @@ class PanelServer:
             if now - self._last_frame_monotonic < _FRAME_MIN_INTERVAL_S:
                 return
             self._last_frame_monotonic = now
-        payload = json.dumps(data, separators=(",", ":"))
+        # allow_nan=False: a bare NaN/Infinity token is invalid strict JSON —
+        # the browser's JSON.parse would throw and permanently wedge that
+        # client's event stream. Better to drop the one poisoned event here.
+        try:
+            payload = json.dumps(data, separators=(",", ":"), allow_nan=False)
+        except ValueError:
+            return
         chunk = f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
         with self._clients_lock:
             if event == "config":
@@ -361,7 +371,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         body = self.rfile.read(length)
         try:
-            obj = json.loads(body)
+            # parse_constant: reject NaN/Infinity tokens at ingress (strict
+            # JSON has no such constants; json.loads accepts them by default
+            # and non-finite floats poison config.json + the SSE stream).
+            obj = json.loads(body, parse_constant=_reject_constant)
         except (ValueError, UnicodeDecodeError):
             self._send_json(400, {"error": "invalid JSON"})
             return

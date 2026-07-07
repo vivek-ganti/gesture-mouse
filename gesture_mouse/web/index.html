@@ -686,8 +686,11 @@ let lastDrawnTs = -1;
 function tick(){
   if (view === 'live'){
     updateNeedles();
-    const ts = F ? F.ts : null;
-    if (ts !== lastDrawnTs){ drawSkeleton(); lastDrawnTs = ts; }
+    // Composite key, not ts alone: idle/camera-fail publishes reuse the last
+    // frame's ts, and the canvas must still repaint the "camera off"/"no
+    // hand" watermark instead of freezing on the final live skeleton.
+    const key = F ? F.ts + '|' + F.session + '|' + (F.landmarks ? 1 : 0) : null;
+    if (key !== lastDrawnTs){ drawSkeleton(); lastDrawnTs = key; }
   }
   requestAnimationFrame(tick);
 }
@@ -835,6 +838,7 @@ function showCapPhase(p){
 }
 function openCapture(){
   cap.open = true; cap.sig = null; cap.glyphKey = '';
+  cap.awaitFresh = true;   // ignore stale done:true frames from a prior capture
   resetCapForm();
   showCapPhase('live');
   $('cap-glyphs').innerHTML = glyphRow(null, true);
@@ -853,6 +857,10 @@ function renderCaptureLive(){
   if (!cap.open || cap.phase !== 'live') return;
   const c = F.capture;
   if (!c) return;
+  if (cap.awaitFresh){
+    if (c.done) return;      // stale pre-capture_start frame: discard
+    cap.awaitFresh = false;  // first fresh (done:false) frame — resume normal flow
+  }
   const gk = JSON.stringify(c.signature);
   if (gk !== cap.glyphKey){
     cap.glyphKey = gk;
@@ -906,6 +914,10 @@ $('cap-x').onclick = function(){ closeCapture(true); };
 $('cap-cancel2').onclick = function(){ closeCapture(true); };
 $('cap-cancel3').onclick = function(){ closeCapture(true); };
 $('cap-retry').onclick = function(){
+  // Frames serialized before the server drains capture_start still carry
+  // the OLD capture dict (done:true + conflicts) — without this flag they
+  // would flip the modal straight back to the conflict screen.
+  cap.awaitFresh = true;
   cap.glyphKey = '';
   showCapPhase('live');
   send('capture_start');
@@ -948,7 +960,11 @@ $('cap-save').onclick = function(){
     cooldown_ms: parseFloat($('g-cool').value) || 1200,
     action: action,
   });
-  closeCapture(false);   // server exits capture mode on save — no cancel needed
+  // Always send capture_cancel after save: on a SUCCESSFUL save the server
+  // already exited capture mode, so the cancel is a harmless no-op — but if
+  // the server REJECTED the save (bad key, duplicate name), it would stay
+  // muted in capture mode forever with the modal already closed.
+  closeCapture(true);
 };
 
 /* ============ calibrate view ============ */
@@ -1043,7 +1059,7 @@ function renderCalibLive(){
       } else if (doneSteps[s.id]){
         done = true; cls += ' done'; badge = '✓ done'; bcls = 'chip ok';
       } else if (cal.failed_step === s.id){
-        badge = 'failed — retry'; bcls = 'chip err';
+        badge = 'failed — retry'; bcls = 'chip red';
       } else if (cal.state === 'await_step' && i === cal.step_i){
         cls += ' next'; badge = 'up next'; bcls = 'chip amber';
       } else {

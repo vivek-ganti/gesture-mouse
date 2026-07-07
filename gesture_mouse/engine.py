@@ -329,18 +329,25 @@ class GestureEngine:
             # Mirrored frame is y-down: an extended (upward-pointing) finger
             # has its tip above its PIP. Config alternative for camera-down
             # geometry where the PIP-angle test's perspective compresses.
-            return lm[tip].y < lm[pip].y
+            # The latch must be kept truthful even in this mode — the panel
+            # readout and capture-by-demonstration read finger_states.
+            ext = lm[tip].y < lm[pip].y
+            self._latches[name].extended = ext
+            return ext
         angle = signatures.pip_angle_deg(lm, mcp, pip, tip)
         extend_at, curl_at = self._finger_thresholds(name)
         return self._latches[name].update(angle, extend_at, curl_at)
 
     def _match(self, sig: signatures.Signature, lm: tuple[Point, ...]) -> bool:
         """Generic signature matcher — the ONE code path shared by built-in
-        poses and user-defined gestures. Evaluates every gating finger's
-        latch each call (keeps all four latches fresh, mirroring the old
-        behavior where each pose test touched all four fingers;
-        ``FingerLatch.update`` is idempotent within a frame at a fixed
-        angle, so multiple pose tests per frame remain safe)."""
+        poses and user-defined gestures. Deliberately evaluates every gating
+        finger's latch each call, with no short-circuit: the latches track
+        the HAND continuously, not the evaluation order of whichever pose
+        test happened to run (the pre-signature pose tests short-circuited,
+        so a later finger's latch could silently skip frames — a subtle
+        behavior change, made intentionally). ``FingerLatch.update`` is
+        idempotent within a frame at a fixed angle, so multiple pose tests
+        per frame remain safe."""
         states = {f: self._ext(f, lm) for f in signatures.FINGERS}
         for finger, want in sig.items():
             if finger not in states or want == "any":

@@ -102,8 +102,12 @@ def main() -> int:
             ext_at = cfg.pose.extend_angle_deg
             per = cfg.pose.fingers
             def _is_ext(f: str) -> bool:
+                # Same two-key rule as GestureEngine._finger_thresholds: a
+                # partial entry (extend without curl) falls back to global.
                 th = per.get(f)
-                at = float(th["extend"]) if isinstance(th, dict) and "extend" in th else ext_at
+                at = (float(th["extend"])
+                      if isinstance(th, dict) and "extend" in th and "curl" in th
+                      else ext_at)
                 return angles[f] >= at
             idx, mid = _is_ext("index"), _is_ext("middle")
             rng, pky = _is_ext("ring"), _is_ext("pinky")
@@ -142,7 +146,7 @@ def main() -> int:
                 lo, hi = int(i), min(int(i) + 1, len(vals) - 1)
                 return vals[lo] + (vals[hi] - vals[lo]) * (i - lo)
             th = cfg.pose.fingers.get(f)
-            if isinstance(th, dict) and "extend" in th:
+            if isinstance(th, dict) and "extend" in th and "curl" in th:
                 th_txt = f"{th['curl']:.0f}/{th['extend']:.0f} (calibrated)"
             elif f == "thumb":
                 th_txt = "- (never gates)"

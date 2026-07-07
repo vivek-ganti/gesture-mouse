@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import dataclasses
+import math
 import signal
 import sys
 import threading
@@ -405,11 +406,7 @@ class App:
                 p.extend_angle_deg = min(180.0, p.extend_angle_deg + delta)
                 p.curl_angle_deg = min(p.extend_angle_deg - _MIN_ANGLE_GAP,
                                         p.curl_angle_deg + delta)
-            for name, th in p.fingers.items():
-                if isinstance(th, dict) and "extend" in th and "curl" in th:
-                    th["extend"] = max(2.0, min(180.0, float(th["extend"]) + delta))
-                    th["curl"] = max(0.0, min(th["extend"] - _MIN_ANGLE_GAP,
-                                              float(th["curl"]) + delta))
+            self._shift_finger_pairs(delta)
             per = ("  (+ per-finger calibrated pairs)" if p.fingers else "")
             self._config_dirty = True
             print(f"[tune] pose extend={p.extend_angle_deg:.0f} "
@@ -441,23 +438,28 @@ class App:
         preference for the next activation. Either way the choice is
         persisted to config.json so it survives a restart."""
         if index < 0 or index >= len(self._camera_names):
-            print(f"[camera] no camera at slot {index + 1}")
+            self._toast_msg("warn", f"no camera at slot {index + 1}")
             return
         name = self._camera_names[index]
-        if isinstance(self.tracker, CameraTracker):
+        # Live-switch only with the camera actually OPEN: while IDLE the
+        # tracker object exists but is closed, and switch_camera() on it
+        # fails — which used to bail before the persist below, silently
+        # ignoring a camera picked from the panel while the camera was off.
+        if isinstance(self.tracker, CameraTracker) and self.session is not SessionState.IDLE:
             switched = self.tracker.switch_camera(index)
             if switched is None:
-                print(f"[camera] switch to {name!r} failed — staying on "
-                      f"{self.tracker.source!r}")
+                self._toast_msg("error", f"switch to {name!r} failed — staying "
+                                         f"on {self.tracker.source!r}")
                 return
             self.pipeline.reset()
             self.engine.reset()
             self._seed_cursor()
-            print(f"[camera] switched to {switched!r}")
+            self._toast_msg("info", f"switched to {switched!r}")
         else:
-            print(f"[camera] will use {name!r} next time the camera opens")
+            self._toast_msg("info", f"will use {name!r} when the camera starts")
         self.cfg.camera.name = name
         self.store.save()
+        self._config_dirty = True
 
     def _maybe_refresh_cameras(self) -> None:
         now = time.monotonic()
@@ -477,11 +479,10 @@ class App:
         except ValueError:
             return None
 
-    def _maybe_reload_config(self) -> None:
-        now = time.monotonic()
-        if now < self._next_reload:
-            return
-        self._next_reload = now + _RELOAD_PERIOD_S
+    def _reload_config_now(self) -> None:
+        """Unthrottled reload-and-reapply: also called right before every
+        panel-driven store.save() so a pending external config.json edit is
+        merged in rather than clobbered by the full-file rewrite."""
         if self.store.reload_if_changed():
             # External edit (or another tool): re-apply live tuning AND
             # re-parse custom gestures so config.json edits hot-apply without
@@ -489,6 +490,13 @@ class App:
             self.engine.reload_customs()
             self.engine.retune_pose_smoothing()
             self._apply_filter_tuning("config.json reloaded")
+
+    def _maybe_reload_config(self) -> None:
+        now = time.monotonic()
+        if now < self._next_reload:
+            return
+        self._next_reload = now + _RELOAD_PERIOD_S
+        self._reload_config_now()
 
     # -- session FSM -----------------------------------------------------------
 
@@ -523,6 +531,11 @@ class App:
         print("WARMUP — camera opening / exposure ramp")
 
     def _deactivate(self, why: str) -> None:
+        # Any exit to IDLE ends calibration/capture too — EVERY deactivation
+        # path (panel stop, toggle/panic hotkey, camera failure) must clear
+        # ui_mode, or the next session would silently drop all intents and
+        # skip guards until a panel Cancel.
+        self._exit_ui_mode()
         if self.synth is not None:
             self.synth.release_all()
         self.engine.reset()
@@ -627,7 +640,7 @@ class App:
             if not self.replay_mode and self.session is SessionState.IDLE:
                 self._activate()
         elif t == "camera_stop":
-            self._exit_ui_mode()
+            self._exit_ui_mode()  # replay mode: _deactivate below is skipped
             if not self.replay_mode and self.session is not SessionState.IDLE:
                 self._deactivate("panel")
         elif t == "camera_switch":
@@ -646,6 +659,11 @@ class App:
         elif t == "calibrate_begin_step":
             if self.calib is not None:
                 self.calib.begin_step(str(pl.get("step", "")), self._last_ts_ms)
+                # A (re)begun step invalidates any computed results — without
+                # this, "Redo this step" after completing all six would show
+                # and APPLY thresholds from the superseded take.
+                self._calib_result_obj = None
+                self._calib_result = None
         elif t == "calibrate_cancel" or t == "capture_cancel":
             self._exit_ui_mode(reset=True)
         elif t == "calibrate_apply":
@@ -657,11 +675,26 @@ class App:
         elif t == "delete_gesture":
             self._delete_gesture(str(pl.get("name", "")))
 
+    def _shift_finger_pairs(self, delta: float) -> None:
+        """Shift every per-finger calibrated extend/curl pair by delta,
+        keeping each pair's gap invariant — shared by the '-'/'=' keyboard
+        tuner and the panel's global pose-angle sliders, so calibration
+        never makes either control silently inert."""
+        for name, th in self.cfg.pose.fingers.items():
+            if isinstance(th, dict) and "extend" in th and "curl" in th:
+                th["extend"] = max(2.0, min(180.0, float(th["extend"]) + delta))
+                th["curl"] = max(0.0, min(th["extend"] - _MIN_ANGLE_GAP,
+                                          float(th["curl"]) + delta))
+
     def _apply_set_setting(self, path: str, value) -> None:
         spec = _SETTINGS.get(path)
         if spec is None:
             self._toast_msg("error", f"setting {path!r} is not adjustable")
             return
+        # Pick up any pending external config.json edit BEFORE mutating and
+        # saving, or save() would silently clobber it (save() rewrites the
+        # whole file from memory and bumps the stored mtime).
+        self._reload_config_now()
         lo, hi, kind = spec
         obj = self.cfg
         parts = path.split(".")
@@ -671,10 +704,24 @@ class App:
             val: object = bool(value)
         else:
             try:
-                val = max(lo, min(hi, float(value)))
+                fval = float(value)
             except (TypeError, ValueError):
                 self._toast_msg("error", f"bad value for {path}: {value!r}")
                 return
+            if fval != fval or fval in (float("inf"), float("-inf")):
+                self._toast_msg("error", f"bad value for {path}: {value!r}")
+                return
+            val = max(lo, min(hi, fval))
+            # The extend/curl PAIR invariant (extend clearly above curl) is
+            # what FingerLatch's within-frame idempotence rests on — enforce
+            # it here exactly like the keyboard tuner does, and mirror the
+            # global shift onto calibrated per-finger pairs.
+            if path == "pose.extend_angle_deg":
+                val = max(val, self.cfg.pose.curl_angle_deg + _MIN_ANGLE_GAP)
+                self._shift_finger_pairs(val - self.cfg.pose.extend_angle_deg)
+            elif path == "pose.curl_angle_deg":
+                val = min(val, self.cfg.pose.extend_angle_deg - _MIN_ANGLE_GAP)
+                self._shift_finger_pairs(val - self.cfg.pose.curl_angle_deg)
         setattr(obj, parts[-1], val)
         if kind == "filter":
             self._apply_filter_tuning(f"{path}={val}")
@@ -817,11 +864,19 @@ class App:
         try:
             hold_ms = float(pl.get("hold_ms", 300.0))
             cooldown_ms = float(pl.get("cooldown_ms", 1200.0))
+            # json.loads happily parses NaN/Infinity (and 1e999 -> inf);
+            # non-finite values would make config.json unparseable and wedge
+            # every panel client's strict JSON.parse.
+            if not (math.isfinite(hold_ms) and math.isfinite(cooldown_ms)):
+                raise ValueError
         except (TypeError, ValueError):
-            self._toast_msg("error", "hold/cooldown must be numbers")
+            self._toast_msg("error", "hold/cooldown must be finite numbers")
             return
+        hold_ms = max(0.0, min(60_000.0, hold_ms))
+        cooldown_ms = max(0.0, min(600_000.0, cooldown_ms))
         entry = {"name": name, "signature": sig, "hold_ms": hold_ms,
                  "cooldown_ms": cooldown_ms, "action": dict(action)}
+        self._reload_config_now()   # don't clobber a pending external edit
         kept = [g for g in self.cfg.custom_gestures
                 if not (isinstance(g, dict)
                         and str(g.get("name", g.get("pose", ""))) == name)]
@@ -835,6 +890,7 @@ class App:
             self._exit_ui_mode(reset=True)
 
     def _delete_gesture(self, name: str) -> None:
+        self._reload_config_now()   # don't clobber a pending external edit
         kept = [g for g in self.cfg.custom_gestures
                 if not (isinstance(g, dict)
                         and str(g.get("name", g.get("pose", ""))) == name)]
@@ -994,6 +1050,10 @@ class App:
             self._camera_fail_tick()
             return
         self._read_fail_since = None
+        # Track the frame clock from EVERY read frame (incl. WARMUP):
+        # calibrate_begin_step stamps its settle/timeout windows with this,
+        # and a 0.0/stale stamp would time the step out instantly.
+        self._last_ts_ms = frame.ts_ms
         self._tee(frame)
 
         if self.session is SessionState.WARMUP and (

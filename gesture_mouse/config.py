@@ -351,5 +351,12 @@ class ConfigStore:
         return True
 
     def save(self) -> None:
-        self.path.write_text(json.dumps(dataclasses.asdict(self.config), indent=2) + "\n")
+        # allow_nan=False: a NaN/Infinity smuggled into a config field would
+        # serialize as a bare non-JSON token, making the file unparseable on
+        # the next load (reload_if_changed would then silently keep serving
+        # the in-memory config forever). Fail loudly here instead.
+        self.path.write_text(
+            json.dumps(dataclasses.asdict(self.config), indent=2, allow_nan=False)
+            + "\n"
+        )
         self._mtime = self.path.stat().st_mtime

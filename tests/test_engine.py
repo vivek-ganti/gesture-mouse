@@ -654,6 +654,27 @@ class TestBentJointPoseClassification:
         assert eng._open_palm_pose(lm) is False
 
 
+class TestYModeLatchSync:
+    def test_finger_states_truthful_in_y_extended_test_mode(self):
+        # The y-mode _ext branch must keep the latches in sync — the panel
+        # readout and capture-by-demonstration read finger_states, and a
+        # permanently all-curled latch set would make every capture freeze
+        # a fist signature regardless of the demonstrated pose.
+        cfg = Config()
+        cfg.options.extended_test = "y"
+        eng = GestureEngine(cfg, lambda name, raw, ts: raw)
+        s = Seq(pose="horns")
+        s.hold("horns", 100)
+        pipe = CursorPipeline(cfg, *SCREEN)
+        for f in s.frames:
+            eng.update(f, pipe.update(f))
+        states = eng.finger_states
+        assert states["index"] is True
+        assert states["pinky"] is True
+        assert states["middle"] is False
+        assert states["ring"] is False
+
+
 class TestRetunePoseSmoothing:
     def test_pushes_cfg_mincutoff_into_the_live_smoother(self):
         cfg = Config()
