@@ -224,6 +224,29 @@ class App:
         self.toggle_evt = threading.Event()
         self.panic_evt = threading.Event()
 
+        # Web control panel (primary UI). Server thread touches nothing but
+        # its own state; all effects flow through poll_commands() drained on
+        # THIS thread; all data flows out via publish().
+        self.panel: PanelServer | None = None
+        if not args.no_panel:
+            port = args.panel_port if args.panel_port else self.cfg.panel.port
+            html = Path(__file__).resolve().parent / "web" / "index.html"
+            self.panel = PanelServer(port, html)
+        # ui_mode gates synthesis: while calibrating/capturing the engine and
+        # pipeline still tick (the wizard needs live angles) but guards are
+        # skipped and NO intents are posted — the user is deliberately using
+        # the real mouse in the browser during these modes.
+        self.ui_mode: str = "normal"
+        self.calib: CalibrationSession | None = None
+        self._calib_result_obj: CalibrationResult | None = None
+        self._calib_result: dict | None = None
+        self._capture: dict | None = None
+        self._toast: dict | None = None
+        self._toast_until = 0.0
+        self._toast_id = 0
+        self._config_dirty = True   # first publish always sends config
+        self._last_ts_ms = 0.0
+
         self.perf = PerfTimer()
         self._read_fail_since: float | None = None  # first failed grab (monotonic s)
         self._warmup_deadline = 0.0
@@ -262,7 +285,8 @@ class App:
         self._cleaned = True
         if self.synth is not None:
             self.synth.release_all()
-        for closer in (self.recorder, self.tracker, self.preview, self.indicator):
+        for closer in (self.recorder, self.tracker, self.preview,
+                       self.indicator, self.panel):
             if closer is not None:
                 try:
                     closer.close()
@@ -336,10 +360,12 @@ class App:
         # set_beta pushes the new beta into the live x/y filters.
         self.pipeline.set_drag(self._drag_state)
         self.pipeline.set_beta(self.cfg.one_euro.beta)
+        self._config_dirty = True   # keep the panel's sliders in sync
         print(f"[tune] {msg}")
 
     def _apply_pose_tuning(self, msg: str) -> None:
         self.engine.retune_pose_smoothing()
+        self._config_dirty = True
         print(f"[tune] {msg}")
 
     def _handle_key(self, key: int) -> None:
@@ -385,6 +411,7 @@ class App:
                     th["curl"] = max(0.0, min(th["extend"] - _MIN_ANGLE_GAP,
                                               float(th["curl"]) + delta))
             per = ("  (+ per-finger calibrated pairs)" if p.fingers else "")
+            self._config_dirty = True
             print(f"[tune] pose extend={p.extend_angle_deg:.0f} "
                   f"curl={p.curl_angle_deg:.0f}{per}")
         elif ch == ",":
@@ -437,7 +464,10 @@ class App:
         if now < self._next_camera_refresh:
             return
         self._next_camera_refresh = now + _CAMERA_REFRESH_PERIOD_S
-        self._camera_names = list_cameras()
+        fresh = list_cameras()
+        if fresh != self._camera_names:
+            self._camera_names = fresh
+            self._config_dirty = True   # panel camera list
 
     def _current_camera_index(self) -> int | None:
         if not isinstance(self.tracker, CameraTracker):
@@ -453,6 +483,11 @@ class App:
             return
         self._next_reload = now + _RELOAD_PERIOD_S
         if self.store.reload_if_changed():
+            # External edit (or another tool): re-apply live tuning AND
+            # re-parse custom gestures so config.json edits hot-apply without
+            # a session reset (panel edits go through the same paths).
+            self.engine.reload_customs()
+            self.engine.retune_pose_smoothing()
             self._apply_filter_tuning("config.json reloaded")
 
     # -- session FSM -----------------------------------------------------------
@@ -549,6 +584,365 @@ class App:
             else:
                 self._deactivate("toggle")
 
+    # -- web panel: lifecycle, commands, publishing -------------------------------
+
+    def _start_panel(self) -> None:
+        if self.panel is None:
+            return
+        try:
+            url = self.panel.start()
+        except Exception as exc:
+            print(f"panel failed to start: {exc}", file=sys.stderr)
+            self.panel = None
+            return
+        print(f"panel: {url}")
+        if (self.cfg.panel.open_browser and not self.args.no_open
+                and not self.replay_mode):
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass  # headless/no default browser: the printed URL suffices
+
+    def _toast_msg(self, level: str, text: str) -> None:
+        """Queue a toast for the panel; rides every frame event for a few
+        seconds (frame events are throttled/droppable, so a single-frame
+        toast could be lost) — the frontend dedupes by id."""
+        self._toast_id += 1
+        self._toast = {"id": self._toast_id, "level": level, "text": text}
+        self._toast_until = time.monotonic() + _TOAST_TTL_S
+        print(f"[panel] {level}: {text}")
+
+    def _poll_panel(self) -> None:
+        if self.panel is None:
+            return
+        for cmd in self.panel.poll_commands():
+            try:
+                self._dispatch_panel(cmd)
+            except Exception as exc:  # a bad command must never kill the loop
+                self._toast_msg("error", f"{cmd.type} failed: {exc}")
+
+    def _dispatch_panel(self, cmd: PanelCommand) -> None:
+        t, pl = cmd.type, cmd.payload
+        if t == "camera_start":
+            if not self.replay_mode and self.session is SessionState.IDLE:
+                self._activate()
+        elif t == "camera_stop":
+            self._exit_ui_mode()
+            if not self.replay_mode and self.session is not SessionState.IDLE:
+                self._deactivate("panel")
+        elif t == "camera_switch":
+            idx = pl.get("index")
+            if isinstance(idx, int) and not self.replay_mode:
+                self._switch_camera(idx)
+                self._config_dirty = True
+        elif t == "panic":
+            self.panic_evt.set()
+        elif t == "quit":
+            self._quit = True
+        elif t == "set_setting":
+            self._apply_set_setting(str(pl.get("path", "")), pl.get("value"))
+        elif t == "calibrate_start":
+            self._calibrate_start()
+        elif t == "calibrate_begin_step":
+            if self.calib is not None:
+                self.calib.begin_step(str(pl.get("step", "")), self._last_ts_ms)
+        elif t == "calibrate_cancel" or t == "capture_cancel":
+            self._exit_ui_mode(reset=True)
+        elif t == "calibrate_apply":
+            self._calibrate_apply()
+        elif t == "capture_start":
+            self._capture_start()
+        elif t == "save_gesture":
+            self._save_gesture(pl)
+        elif t == "delete_gesture":
+            self._delete_gesture(str(pl.get("name", "")))
+
+    def _apply_set_setting(self, path: str, value) -> None:
+        spec = _SETTINGS.get(path)
+        if spec is None:
+            self._toast_msg("error", f"setting {path!r} is not adjustable")
+            return
+        lo, hi, kind = spec
+        obj = self.cfg
+        parts = path.split(".")
+        for part in parts[:-1]:
+            obj = getattr(obj, part)
+        if kind == "bool":
+            val: object = bool(value)
+        else:
+            try:
+                val = max(lo, min(hi, float(value)))
+            except (TypeError, ValueError):
+                self._toast_msg("error", f"bad value for {path}: {value!r}")
+                return
+        setattr(obj, parts[-1], val)
+        if kind == "filter":
+            self._apply_filter_tuning(f"{path}={val}")
+        elif kind == "pose":
+            self._apply_pose_tuning(f"{path}={val}")
+        self.store.save()
+        self._config_dirty = True
+
+    # -- calibration + capture modes ----------------------------------------
+
+    def _enter_ui_mode(self, mode: str) -> bool:
+        """Common entry ritual: nothing may stay held while synthesis is
+        muted, and the engine restarts from a clean clutch on exit."""
+        if self.session is SessionState.IDLE and not self.replay_mode:
+            self._toast_msg("warn", "start the camera first")
+            return False
+        if self.synth is not None:
+            self.synth.release_all()
+        self.engine.notify_suspended()
+        self.ui_mode = mode
+        return True
+
+    def _exit_ui_mode(self, reset: bool = False) -> None:
+        was = self.ui_mode
+        self.ui_mode = "normal"
+        self.calib = None
+        self._calib_result_obj = None
+        self._calib_result = None
+        self._capture = None
+        if was != "normal" and reset:
+            self.engine.reset()
+            # The user was just mousing in the browser: re-baseline the
+            # divergence guard or normal mode would instantly suspend.
+            self._seed_cursor()
+            if self.guards is not None:
+                self.guards.rearm()
+
+    def _calibrate_start(self) -> None:
+        if self.cfg.options.extended_test != "radial":
+            self._toast_msg("warn", "calibration needs the angle-based finger "
+                                    "test (options.extended_test='radial')")
+            return
+        if not self._enter_ui_mode("calibrating"):
+            return
+        self.calib = CalibrationSession()
+        self._calib_result_obj = None
+        self._calib_result = None
+        self._toast_msg("info", "calibration started — run all six steps")
+
+    def _calibrate_apply(self) -> None:
+        if self._calib_result_obj is None:
+            self._toast_msg("warn", "no calibration results to apply yet")
+            return
+        applied = []
+        for f, fr in self._calib_result_obj.fingers.items():
+            if fr.extend is None or fr.curl is None:
+                continue
+            entry: dict = {"extend": fr.extend, "curl": fr.curl}
+            if f == "thumb":
+                entry["advisory"] = True  # stored, never gates (see PoseConfig)
+            self.cfg.pose.fingers[f] = entry
+            applied.append(f)
+        self.store.save()
+        self._config_dirty = True
+        self._toast_msg("info", "calibration applied: " +
+                        (", ".join(applied) if applied else "no fingers (kept defaults)"))
+        self._exit_ui_mode(reset=True)
+
+    def _capture_start(self) -> None:
+        if not self._enter_ui_mode("capturing"):
+            return
+        self._capture = {"sig": None, "since": None,
+                         "start": time.monotonic(), "done": False,
+                         "conflicts": [], "stable_ms": 0.0}
+
+    def _known_signatures(self, excluding: str | None = None) -> dict:
+        named = dict(signatures.BUILTINS)
+        parsed, _ = signatures.normalize_custom_entries(self.cfg.custom_gestures)
+        for g in parsed:
+            if g["name"] != excluding:
+                named[g["name"]] = g["signature"]
+        return named
+
+    def _ui_mode_tick(self, frame: LandmarkFrame) -> None:
+        """Per-frame work for the active ui_mode (called from both loops)."""
+        self._last_ts_ms = frame.ts_ms
+        if self.ui_mode == "calibrating" and self.calib is not None:
+            self.calib.add_sample(frame.ts_ms, self.engine.finger_angles)
+            if self.calib.state == "done" and self._calib_result_obj is None:
+                self._calib_result_obj = self.calib.compute(
+                    (self.cfg.pose.extend_angle_deg, self.cfg.pose.curl_angle_deg),
+                    {n: s for n, s in self._known_signatures().items()
+                     if n not in signatures.BUILTINS},
+                )
+                self._calib_result = self._calib_result_obj.as_dict()
+        elif self.ui_mode == "capturing" and self._capture is not None:
+            cap = self._capture
+            if cap["done"]:
+                return
+            if time.monotonic() - cap["start"] > _CAPTURE_TIMEOUT_S:
+                self._toast_msg("warn", "capture timed out — try again")
+                self._exit_ui_mode(reset=True)
+                return
+            if not self.engine.finger_angles:
+                cap["sig"] = None
+                cap["since"] = None
+                cap["stable_ms"] = 0.0
+                return
+            sig = signatures.signature_from_states(self.engine.finger_states)
+            if sig != cap["sig"]:
+                cap["sig"] = sig
+                cap["since"] = frame.ts_ms
+                cap["stable_ms"] = 0.0
+                return
+            cap["stable_ms"] = frame.ts_ms - (cap["since"] or frame.ts_ms)
+            if cap["stable_ms"] >= _CAPTURE_STABLE_MS:
+                cap["done"] = True
+                cap["conflicts"] = signatures.check_conflicts(
+                    sig, self._known_signatures())
+
+    def _save_gesture(self, pl: dict) -> None:
+        name = str(pl.get("name", "")).strip()
+        sig = signatures.normalize_signature(pl.get("signature"))
+        action = pl.get("action") if isinstance(pl.get("action"), dict) else None
+        if not name or sig is None or action is None:
+            self._toast_msg("error", "invalid gesture: needs a name, a "
+                                     "signature and an action")
+            return
+        if name in signatures.BUILTINS:
+            self._toast_msg("error", f"{name!r} is a built-in gesture name")
+            return
+        if custom_action_argv(action) is None:
+            self._toast_msg("error", "invalid action (unknown type/key/trigger)")
+            return
+        conflicts = signatures.check_conflicts(
+            sig, self._known_signatures(excluding=name))
+        if conflicts:
+            self._toast_msg("error", "pose collides with: " + ", ".join(conflicts))
+            return
+        try:
+            hold_ms = float(pl.get("hold_ms", 300.0))
+            cooldown_ms = float(pl.get("cooldown_ms", 1200.0))
+        except (TypeError, ValueError):
+            self._toast_msg("error", "hold/cooldown must be numbers")
+            return
+        entry = {"name": name, "signature": sig, "hold_ms": hold_ms,
+                 "cooldown_ms": cooldown_ms, "action": dict(action)}
+        kept = [g for g in self.cfg.custom_gestures
+                if not (isinstance(g, dict)
+                        and str(g.get("name", g.get("pose", ""))) == name)]
+        kept.append(entry)
+        self.cfg.custom_gestures[:] = kept   # in-place: modules hold this list
+        self.store.save()
+        self.engine.reload_customs()
+        self._config_dirty = True
+        self._toast_msg("info", f"gesture {name!r} saved")
+        if self.ui_mode == "capturing":
+            self._exit_ui_mode(reset=True)
+
+    def _delete_gesture(self, name: str) -> None:
+        kept = [g for g in self.cfg.custom_gestures
+                if not (isinstance(g, dict)
+                        and str(g.get("name", g.get("pose", ""))) == name)]
+        if len(kept) == len(self.cfg.custom_gestures):
+            self._toast_msg("warn", f"no gesture named {name!r}")
+            return
+        self.cfg.custom_gestures[:] = kept
+        self.store.save()
+        self.engine.reload_customs()
+        self._config_dirty = True
+        self._toast_msg("info", f"gesture {name!r} deleted")
+
+    # -- panel publishing -----------------------------------------------------
+
+    def _config_event(self) -> dict:
+        parsed, _ = signatures.normalize_custom_entries(self.cfg.custom_gestures)
+        settings: dict = {}
+        for path in _SETTINGS:
+            obj = self.cfg
+            for part in path.split("."):
+                obj = getattr(obj, part)
+            settings[path] = obj
+        return {
+            "settings": settings,
+            "custom_gestures": parsed,
+            "builtin_gestures": [
+                {"name": n, "signature": dict(s), "editable": False}
+                for n, s in signatures.BUILTINS.items()
+            ],
+            "cameras": list(self._camera_names),
+            "camera_index": self._current_camera_index(),
+            "calib_defaults": {"extend": self.cfg.pose.extend_angle_deg,
+                               "curl": self.cfg.pose.curl_angle_deg},
+            "calib_steps": [
+                {"id": s.id, "label": s.label, "instruction": s.instruction,
+                 "expected": dict(s.expected)}
+                for s in CALIB_STEPS
+            ],
+            "pose_fingers": {k: dict(v) for k, v in self.cfg.pose.fingers.items()
+                             if isinstance(v, dict)},
+        }
+
+    def _publish_panel(self, frame: LandmarkFrame | None, snap: StateSnapshot) -> None:
+        if self.panel is None:
+            return
+        if self._config_dirty:
+            # Config publishes even with zero clients: the server replays the
+            # last config event to late joiners, so this primes reconnects.
+            self.panel.publish("config", self._config_event())
+            self._config_dirty = False
+        if not self.panel.has_clients():
+            return
+        lm = self.engine.smoothed_landmarks if (frame is not None
+                                                and frame.hand_present) else None
+        thresholds = {}
+        for f in signatures.FINGERS:
+            per = self.cfg.pose.fingers.get(f)
+            calibrated = isinstance(per, dict) and "extend" in per and "curl" in per
+            if calibrated:
+                ext_at, curl_at = float(per["extend"]), float(per["curl"])
+            else:
+                ext_at = self.cfg.pose.extend_angle_deg
+                curl_at = self.cfg.pose.curl_angle_deg
+            thresholds[f] = {"extend": ext_at, "curl": curl_at,
+                             "calibrated": calibrated}
+        pv = self.engine.pinch_values
+        pd = self.engine.palm_debug
+        calibration = None
+        if self.calib is not None:
+            calibration = self.calib.progress()
+            calibration["results"] = self._calib_result
+        capture = None
+        if self._capture is not None:
+            capture = {"active": True, "signature": self._capture["sig"],
+                       "stable_ms": self._capture["stable_ms"],
+                       "done": self._capture["done"],
+                       "conflicts": self._capture["conflicts"]}
+        toast = self._toast if time.monotonic() < self._toast_until else None
+        p = self.cfg.pinch
+        ev = frame_event(
+            ts=frame.ts_ms if frame is not None else self._last_ts_ms,
+            session=snap.session_state.value,
+            engine=snap.engine_state.value if snap.engine_state else None,
+            hand=snap.hand_present,
+            fps=snap.fps,
+            latency_ms=snap.latency_ms,
+            suspend_reason=snap.suspend_reason,
+            img_w=frame.img_w if frame is not None else self.cfg.camera.width,
+            img_h=frame.img_h if frame is not None else self.cfg.camera.height,
+            landmarks=[[pt.x, pt.y] for pt in lm] if lm is not None else None,
+            finger_angles=self.engine.finger_angles,
+            finger_states=self.engine.finger_states,
+            thresholds=thresholds,
+            pinch={"left": pv.get("left"), "right": pv.get("right")},
+            pinch_cfg={"left_engage": p.left_engage, "left_release": p.left_release,
+                       "right_engage": p.right_engage, "right_release": p.right_release},
+            palm={"open": bool(pd.get("open")),
+                  "phase": pd.get("phase"),
+                  "m": pd.get("m") if isinstance(pd.get("m"), float) else None,
+                  "disp_frac": pd.get("disp_frac")
+                  if isinstance(pd.get("disp_frac"), float) else None},
+            mode=self.ui_mode,
+            calibration=calibration,
+            capture=capture,
+            toast=toast,
+        )
+        self.panel.publish("frame", ev)
+
     # -- camera loop -------------------------------------------------------------
 
     def _run_camera(self) -> int:
@@ -560,12 +954,15 @@ class App:
             f"hotkeys: toggle={self.cfg.hotkeys.toggle}  "
             f"panic={self.cfg.hotkeys.panic}"
         )
+        self._start_panel()
         if self.args.start_active:
             self._activate()
         else:
-            print("IDLE — camera off; press the toggle hotkey to start")
+            print("IDLE — camera off; press the toggle hotkey to start, "
+                  "or Start camera in the panel")
         while not self._quit:
             self._poll_hotkeys()
+            self._poll_panel()
             if self.session is SessionState.IDLE:
                 self._idle_tick()
             else:
@@ -583,6 +980,8 @@ class App:
                 current_camera_index=self._current_camera_index(),
             )
             self._handle_key(key)
+        self._publish_panel(None, snap)
+        self._maybe_reload_config()
         time.sleep(_IDLE_TICK_S)
 
     def _frame_tick(self) -> None:
@@ -616,9 +1015,16 @@ class App:
             return
 
         out = self._step(frame)
+        self._ui_mode_tick(frame)
 
         t2 = time.perf_counter()
-        if self.session is SessionState.ACTIVE:
+        if self.ui_mode != "normal":
+            # Calibrating/capturing: engine+pipeline tick (the wizard needs
+            # live angles) but guards are skipped and intents are DROPPED —
+            # the user is deliberately mousing in the browser right now, and
+            # mode entry released everything, so nothing can be held.
+            pass
+        elif self.session is SessionState.ACTIVE:
             reason = self._guard_trip()   # BEFORE posting, every frame
             if reason is not None:
                 self._suspend(reason)
@@ -665,6 +1071,7 @@ class App:
                 current_camera_index=self._current_camera_index(),
             )
             self._handle_key(key)
+        self._publish_panel(None, snap)
         time.sleep(0.01)
 
     def _finish_tick(self, t0: float, frame: LandmarkFrame) -> None:
@@ -683,6 +1090,7 @@ class App:
                 current_camera_index=self._current_camera_index(),
             )
             self._handle_key(key)
+        self._publish_panel(frame, snap)
         self.perf.add("ui", (time.perf_counter() - t3) * 1e3)
         self.perf.maybe_print()
         self._maybe_reload_config()
@@ -703,6 +1111,9 @@ class App:
             register_hotkeys(self.toggle_evt.set, self.panic_evt.set, self.cfg.hotkeys)
             if self.guards is not None:
                 self.guards.rearm()
+        # Panel works against replay too — the only camera-free way to
+        # exercise the full frontend data path.
+        self._start_panel()
         self.session = SessionState.ACTIVE
         n_frames = n_intents = 0
         prev_ts: float | None = None
@@ -722,6 +1133,8 @@ class App:
                 prev_ts = frame.ts_ms
             self._tee(frame)
             out = self._step(frame)
+            self._poll_panel()
+            self._ui_mode_tick(frame)
             if self.post_events:
                 pump_events()  # hotkey delivery: nothing else pumps in replay
                 if self.panic_evt.is_set() or self.toggle_evt.is_set():
@@ -745,12 +1158,13 @@ class App:
                 else:
                     print(_fmt_intent(intent))
             self._update_rates(t0)
+            snap = self._snapshot(frame.hand_present)
             if self.preview is not None:
-                snap = self._snapshot(frame.hand_present)
                 self._handle_key(
                     self.preview.show(None, frame, snap, self.engine.pinch_values,
                                        palm_debug=self.engine.palm_debug)
                 )
+            self._publish_panel(frame, snap)
             self.perf.maybe_print()
             n_frames += 1
         print(f"replay done: {n_frames} frames, {n_intents} intents, "
