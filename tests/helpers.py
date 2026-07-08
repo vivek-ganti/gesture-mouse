@@ -60,6 +60,12 @@ _POSES = {
                  "pinky": "half"}, (-20.0, 30.0)),
     "horns": ({"index": "ext", "middle": "curl", "ring": "curl",
                "pinky": "ext"}, (-20.0, 30.0)),
+    # Mid-formation rock sign: pinky already up, middle still descending
+    # ("half" reads as extended under the angle metric — collinear joints).
+    # Used to prove a fake thumb-middle pinch during the transition cannot
+    # confirm a right click (the pinky-curled requirement).
+    "horns_forming": ({"index": "ext", "middle": "half", "ring": "curl",
+                       "pinky": "ext"}, (-20.0, 30.0)),
 }
 
 

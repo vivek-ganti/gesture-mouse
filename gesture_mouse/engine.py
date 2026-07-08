@@ -394,7 +394,7 @@ class GestureEngine:
         ignored (unreliable). Mutually exclusive with pointer (pinky curled
         there), scroll (middle extended there) and open-palm (middle+ring
         extended there) — so it can't collide with any built-in gesture."""
-        return self._match(signatures.BUILTINS["horns"], lm)
+        return self._match(signatures.HORNS_SIG, lm)
 
     def _scroll_pose(self, lm: tuple[Point, ...], scale: float) -> bool:
         if not self._match(signatures.BUILTINS["scroll"], lm):
@@ -827,8 +827,16 @@ class GestureEngine:
             self._left_latch = None
 
         # Right candidacy REQUIRES a clearly extended index (kills the
-        # thumb-transit-past-index misfire class).
-        if rv < p.right_engage and self._index_extended(lm):
+        # thumb-transit-past-index misfire class) AND a curled pinky. The
+        # pinky requirement kills the horns-formation race: while forming
+        # the rock sign the thumb lands on the middle fingertip BEFORE the
+        # middle finger's latch reads curled, so for that transition window
+        # the custom-pose gate above is still inactive and the hand is a
+        # perfect fake right-pinch — but the pinky is already up from the
+        # first frame of the sign, while the canonical right-click pose
+        # (index up, ring+pinky folded) always has it down.
+        if (rv < p.right_engage and self._index_extended(lm)
+                and not self._ext("pinky", lm)):
             if self._right_since is None:
                 self._right_since = ts
         else:
@@ -848,7 +856,9 @@ class GestureEngine:
             if l_min > p.arbitration_ratio * w_min:
                 if winner == "left" and lv < p.left_release:
                     return self._confirm_left(cursor, ts)
-                if winner == "right" and rv < p.right_release and self._index_extended(lm):
+                if (winner == "right" and rv < p.right_release
+                        and self._index_extended(lm)
+                        and not self._ext("pinky", lm)):
                     return self._confirm_right(cursor, ts)
             # Ambiguous (or the winner already let go): do nothing, restart.
             self._clear_pinch()

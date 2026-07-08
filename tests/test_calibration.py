@@ -161,9 +161,13 @@ class TestSteps:
     def test_expected_maps_match_builtin_signatures(self):
         # "ignore" in a step must line up with "any" in the signature (the
         # finger is neither sampled nor gated there); ext/curl must agree.
+        # horns isn't a BUILTIN (it's the dictate default's pose) but its
+        # calibration step must still mirror HORNS_SIG.
+        from gesture_mouse.signatures import HORNS_SIG
+        sigs = dict(BUILTINS, horns=HORNS_SIG)
         by_id = {s.id: s for s in STEPS}
         for name in ("pointer", "open_palm", "scroll", "horns"):
-            expected, sig = by_id[name].expected, BUILTINS[name]
+            expected, sig = by_id[name].expected, sigs[name]
             for f in FINGERS:
                 if sig.get(f, "any") == "any":
                     assert expected[f] == "ignore"

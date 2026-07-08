@@ -65,25 +65,32 @@ FINGER_JOINTS: dict[str, tuple[int, int, int]] = {
 BUILTINS: dict[str, Signature] = {
     "pointer": {"index": "ext", "middle": "curl", "ring": "curl", "pinky": "curl"},
     "open_palm": {"index": "ext", "middle": "ext", "ring": "ext", "pinky": "ext"},
-    # The ring finger is "any" in scroll and horns, deliberately: it is the
-    # least independent finger (shared tendon with middle and pinky), so it
-    # physically CANNOT fully curl while middle is extended (scroll) or
-    # pinky is extended (horns) on most hands — requiring ring:curl there
-    # made both gestures miss for anyone whose ring hovers half-curled,
-    # which real calibration data showed (a ~24 deg ring band). Neither
-    # pose needs the ring to disambiguate: every builtin pair below is
-    # still separated by index/middle/pinky alone.
+    # The ring finger is "any" in scroll (and HORNS_SIG below), deliberately:
+    # it is the least independent finger (shared tendon with middle and
+    # pinky), so it physically CANNOT fully curl while middle is extended
+    # (scroll) or pinky is extended (horns) on most hands — requiring
+    # ring:curl there made both gestures miss for anyone whose ring hovers
+    # half-curled, which real calibration data showed (a ~24 deg ring band).
+    # Neither pose needs the ring to disambiguate.
     #
     # scroll ALSO requires dist(INDEX_TIP, MIDDLE_TIP)/scale < together_max,
     # enforced engine-side — the signature alone is deliberately reserved
     # (a captured custom gesture may not claim it; see check_conflicts).
     "scroll": {"index": "ext", "middle": "ext", "ring": "any", "pinky": "curl"},
-    "horns": {"index": "ext", "middle": "curl", "ring": "any", "pinky": "ext"},
 }
+
+# The rock sign 🤘 — deliberately NOT in BUILTINS: it drives no engine state
+# and owns no action; it is merely the pose the shipped "dictate" custom
+# gesture binds. Listing it as a builtin made the conflict checker reject
+# every user-captured rock-like pose for "colliding with horns" — a phantom
+# gesture that does nothing. Ownership of the pose belongs to whichever
+# CUSTOM gesture currently claims it (conflicts against customs still apply),
+# so deleting/editing that gesture frees the pose.
+HORNS_SIG: Signature = {"index": "ext", "middle": "curl", "ring": "any", "pinky": "ext"}
 
 # Back-compat: config entries written as {"pose": "<name>", ...} before the
 # signature schema existed. Only "horns" ever shipped.
-LEGACY_POSES: dict[str, Signature] = {"horns": BUILTINS["horns"]}
+LEGACY_POSES: dict[str, Signature] = {"horns": HORNS_SIG}
 
 _VALID_STATES = frozenset({"ext", "curl", "any"})
 

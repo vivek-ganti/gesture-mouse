@@ -79,8 +79,14 @@ FINGERS = ("index", "middle", "ring", "pinky")   # gate matching
 ALL_FINGERS = ("thumb",) + FINGERS               # sampled/displayed only
 Signature = dict   # finger -> "ext" | "curl" | "any"; missing key == "any"
 FINGER_JOINTS: dict[str, (mcp, pip, tip)]        # thumb uses MCP/IP/TIP
-BUILTINS: dict[str, Signature]                   # pointer/open_palm/scroll/horns
-LEGACY_POSES = {"horns": BUILTINS["horns"]}      # {"pose": "horns"} back-compat
+BUILTINS: dict[str, Signature]   # pointer/open_palm/scroll ONLY — poses that
+                                 # drive engine states. horns is deliberately
+                                 # NOT here: it owns no action, it's just the
+                                 # pose the dictate default claims (a phantom
+                                 # builtin blocked user captures of any
+                                 # rock-like pose as "collides with horns").
+HORNS_SIG: Signature             # the rock sign; ring is "any" here too
+LEGACY_POSES = {"horns": HORNS_SIG}   # {"pose": "horns"} back-compat
 
 def pip_angle_deg(lm, mcp, pip, tip) -> float    # interior angle: 180=straight, 0=folded
 def compute_finger_angles(lm) -> dict[str, float]   # all five, thumb included
@@ -231,7 +237,9 @@ left pinch with conditional position latch + release latch + hysteresis +
 debounce + scale-stability gate; drag (12px distance-only unfreeze, in-drag
 release 0.60, minor-axis dead-band, drag filter mode); double click (500ms /
 15px window, relaxed 0.44/0.42 thresholds, click_count=2); right = thumb-middle
-pinch with index-extended requirement + argmin arbitration; scroll (pose+speed
+pinch with index-extended AND pinky-curled requirements (pinky-up = a
+custom-pose formation like the rock sign, never a right click — kills the
+thumb-lands-on-middle-before-middle-curls race) + argmin arbitration; scroll (pose+speed
 gate entry, joystick velocity -> scroll MOVE intents with dy_px per frame,
 zero velocity when exit-counting starts); HANDS_LOST (freeze on first missing
 frame, auto-UP after hands_lost_ms, reacquire via clutch 250ms); anchor jump

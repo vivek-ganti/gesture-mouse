@@ -14,6 +14,7 @@ from gesture_mouse.engine import GestureEngine
 from gesture_mouse.signatures import (
     BUILTINS,
     FINGERS,
+    HORNS_SIG,
     FingerLatch,
     check_conflicts,
     compute_finger_angles,
@@ -44,10 +45,13 @@ class TestMatcherTruthTable:
         ],
     )
     def test_each_builtin_matches_its_own_shape_only(self, pose, angles):
+        # horns is not a BUILTIN (it's the pose the dictate custom claims,
+        # HORNS_SIG) but must stay mutually exclusive with all of them.
         eng = make_engine()
         lm = eng._smoother.smooth(make_bent_frame(0.0, angles))
         for name, sig in BUILTINS.items():
             assert eng._match(sig, lm) is (name == pose)
+        assert eng._match(HORNS_SIG, lm) is (pose == "horns")
 
     def test_any_finger_never_gates(self):
         eng = make_engine()
@@ -72,26 +76,35 @@ class TestMatcherTruthTable:
 
 class TestConflicts:
     def test_builtins_are_mutually_exclusive(self):
-        names = list(BUILTINS)
+        # incl. HORNS_SIG: not a builtin, but it must stay separable from
+        # every builtin so the dictate default can never shadow one.
+        sigs = dict(BUILTINS, horns=HORNS_SIG)
+        names = list(sigs)
         for i, a in enumerate(names):
             for b in names[i + 1:]:
-                assert signatures_conflict(BUILTINS[a], BUILTINS[b]) is False
+                assert signatures_conflict(sigs[a], sigs[b]) is False
 
     def test_permissive_signature_conflicts_with_everything(self):
         assert check_conflicts({"index": "ext"}, BUILTINS) == list(BUILTINS)
 
+    def test_horns_not_a_builtin(self):
+        # A phantom builtin with no action blocked every user-captured
+        # rock-like pose ("collides with: horns"); the pose belongs to
+        # whichever CUSTOM gesture claims it.
+        assert "horns" not in BUILTINS
+
     def test_identical_signature_conflicts(self):
-        assert signatures_conflict(BUILTINS["horns"], dict(BUILTINS["horns"])) is True
+        assert signatures_conflict(HORNS_SIG, dict(HORNS_SIG)) is True
 
     def test_single_separating_finger_resolves(self):
         # pointer vs horns differ only in pinky — that one finger separates.
-        assert signatures_conflict(BUILTINS["pointer"], BUILTINS["horns"]) is False
+        assert signatures_conflict(BUILTINS["pointer"], HORNS_SIG) is False
 
     def test_ring_is_any_in_scroll_and_horns(self):
         # Anatomical: the ring cannot fully curl while middle (scroll) or
         # pinky (horns) is extended — it must never gate those poses.
         assert BUILTINS["scroll"]["ring"] == "any"
-        assert BUILTINS["horns"]["ring"] == "any"
+        assert HORNS_SIG["ring"] == "any"
 
 
 class TestNormalizeSignature:
@@ -122,13 +135,13 @@ class TestNormalizeSignature:
 class TestNormalizeCustomEntries:
     ACTION = {"type": "key", "key": "option"}
 
-    def test_legacy_horns_entry_maps_to_builtin_signature(self):
+    def test_legacy_horns_entry_maps_to_horns_signature(self):
         parsed, skipped = normalize_custom_entries(
             [{"name": "dictate", "pose": "horns", "action": dict(self.ACTION)}]
         )
         assert skipped == []
         assert parsed[0]["name"] == "dictate"
-        assert parsed[0]["signature"] == BUILTINS["horns"]
+        assert parsed[0]["signature"] == HORNS_SIG
         assert parsed[0]["hold_ms"] == 300.0 and parsed[0]["cooldown_ms"] == 1200.0
 
     def test_v2_signature_entry(self):
@@ -171,12 +184,14 @@ class TestNormalizeCustomEntries:
 class TestSignatureFromStates:
     def test_pins_all_four_gating_fingers(self):
         # Capture always pins all four (no "any" from capture in v1) — so a
-        # captured rock sign is STRICTER than the builtin horns signature
-        # (whose ring is "any") and correctly conflicts with it.
+        # captured rock sign is STRICTER than the dictate default's horns
+        # signature (whose ring is "any") and correctly conflicts with THAT
+        # custom gesture — but with no builtin (horns isn't one).
         sig = signature_from_states({"index": True, "middle": False, "ring": False, "pinky": True})
         assert sig == {"index": "ext", "middle": "curl", "ring": "curl", "pinky": "ext"}
         assert "thumb" not in sig
-        assert signatures_conflict(sig, BUILTINS["horns"]) is True
+        assert signatures_conflict(sig, HORNS_SIG) is True
+        assert check_conflicts(sig, BUILTINS) == []
 
 
 class TestComputeFingerAngles:

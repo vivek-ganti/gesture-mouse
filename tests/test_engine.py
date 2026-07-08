@@ -673,6 +673,29 @@ def test_horns_with_thumb_on_middle_fires_custom_not_right_click():
     assert eng.state is not EngineState.RIGHT_PINCH
 
 
+def test_slow_horns_formation_cannot_confirm_right_pinch():
+    # The formation RACE (distinct from the resting-thumb case above): the
+    # thumb reaches the middle fingertip BEFORE the middle finger's latch
+    # reads curled, so the custom-pose suppression gate is still inactive —
+    # for that window the hand is a perfect fake right-pinch, and >100ms of
+    # it used to confirm RIGHT_PINCH, which blocks the custom loop for as
+    # long as the sign is held ("horns never fires"). The pinky-curled
+    # requirement on right candidacy kills this: in the rock sign the pinky
+    # is up from the very first frame, while a real right-click pose always
+    # has it folded.
+    cfg = Config()
+    s = Seq()
+    s.hold("pointer", 400)              # clutch -> POINTER
+    s.hold("horns_forming", 33)         # pinky up, middle NOT yet curled
+    s.pinch_middle_to(0.2, 66)          # thumb lands on the middle tip early
+    s.hold(ms=200)                      # >engage_ms in the fake-pinch window
+    s.hold("horns", 500)                # sign completes; dictate must fire
+    intents, _, eng = run(s.frames, cfg=cfg)
+    assert named(intents, "right") == []
+    assert len(named(intents, "custom:dictate")) == 1
+    assert eng.state is not EngineState.RIGHT_PINCH
+
+
 def test_scroll_enters_with_ring_stuck_half_extended():
     # Anatomical regression: after an open palm latches every finger
     # extended, the ring physically cannot fully curl while the middle
