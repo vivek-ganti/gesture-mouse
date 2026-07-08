@@ -159,11 +159,26 @@ class TestSteps:
         ]
 
     def test_expected_maps_match_builtin_signatures(self):
+        # "ignore" in a step must line up with "any" in the signature (the
+        # finger is neither sampled nor gated there); ext/curl must agree.
         by_id = {s.id: s for s in STEPS}
         for name in ("pointer", "open_palm", "scroll", "horns"):
-            assert by_id[name].expected == BUILTINS[name]
+            expected, sig = by_id[name].expected, BUILTINS[name]
+            for f in FINGERS:
+                if sig.get(f, "any") == "any":
+                    assert expected[f] == "ignore"
+                else:
+                    assert expected[f] == sig[f]
         assert by_id["fist"].expected == {f: "curl" for f in FINGERS}
         assert by_id["relaxed"].expected == {f: "ignore" for f in FINGERS}
+
+    def test_every_gating_finger_has_ext_and_curl_sources(self):
+        # The ring-"ignore" change must never orphan a finger's clusters.
+        for f in FINGERS:
+            exts = [s.id for s in STEPS if s.expected.get(f) == "ext"]
+            curls = [s.id for s in STEPS if s.expected.get(f) == "curl"]
+            assert exts, f"{f} has no extended-sample source step"
+            assert curls, f"{f} has no curled-sample source step"
 
     def test_labels_and_instructions_present(self):
         for s in STEPS:

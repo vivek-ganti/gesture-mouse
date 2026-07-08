@@ -205,6 +205,12 @@ camera for a second — the app captures which fingers are up/down as the
 gesture's signature, warns if it collides with an existing gesture, then you
 name it and pick its action. Saved to `config.json`, live immediately.
 
+Every saved gesture's card has **test** (fires the action right now, no
+pose needed — verifies the binding), **edit** (change the action, hold and
+cooldown times; to change the pose itself, delete and re-capture) and
+**delete**. To verify the pose registers, watch the Live tab while holding
+it: a "holding <name> N%" chip fills toward 100%, then the action fires.
+
 A gesture = a per-finger signature (which of index/middle/ring/pinky are
 extended vs curled; the thumb never gates — its hinge reads unreliably) +
 `hold_ms` (hold the pose this long, mostly-still hand) + an action +

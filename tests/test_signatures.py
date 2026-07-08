@@ -87,6 +87,12 @@ class TestConflicts:
         # pointer vs horns differ only in pinky — that one finger separates.
         assert signatures_conflict(BUILTINS["pointer"], BUILTINS["horns"]) is False
 
+    def test_ring_is_any_in_scroll_and_horns(self):
+        # Anatomical: the ring cannot fully curl while middle (scroll) or
+        # pinky (horns) is extended — it must never gate those poses.
+        assert BUILTINS["scroll"]["ring"] == "any"
+        assert BUILTINS["horns"]["ring"] == "any"
+
 
 class TestNormalizeSignature:
     def test_valid_passthrough(self):
@@ -164,9 +170,13 @@ class TestNormalizeCustomEntries:
 
 class TestSignatureFromStates:
     def test_pins_all_four_gating_fingers(self):
+        # Capture always pins all four (no "any" from capture in v1) — so a
+        # captured rock sign is STRICTER than the builtin horns signature
+        # (whose ring is "any") and correctly conflicts with it.
         sig = signature_from_states({"index": True, "middle": False, "ring": False, "pinky": True})
-        assert sig == BUILTINS["horns"]
+        assert sig == {"index": "ext", "middle": "curl", "ring": "curl", "pinky": "ext"}
         assert "thumb" not in sig
+        assert signatures_conflict(sig, BUILTINS["horns"]) is True
 
 
 class TestComputeFingerAngles:

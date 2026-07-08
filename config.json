@@ -83,6 +83,40 @@
     "min_presence_confidence": 0.4,
     "min_tracking_confidence": 0.3
   },
+  "preview": {
+    "canvas_w": 960,
+    "canvas_h": 540
+  },
+  "pose": {
+    "extend_angle_deg": 160.0,
+    "curl_angle_deg": 130.0,
+    "fingers": {
+      "thumb": {
+        "extend": 162.9,
+        "curl": 137.9,
+        "advisory": true
+      },
+      "index": {
+        "extend": 162.7,
+        "curl": 77.7
+      },
+      "middle": {
+        "extend": 165.1,
+        "curl": 88.1
+      },
+      "ring": {
+        "extend": 156.3,
+        "curl": 131.9
+      }
+    },
+    "smoothing_mincutoff": 1.5,
+    "smoothing_beta": 0.02,
+    "smoothing_dcutoff": 1.0
+  },
+  "panel": {
+    "port": 8765,
+    "open_browser": true
+  },
   "suspend": {
     "mouse_divergence_px": 8.0,
     "keyboard_mute_ms": 1500.0

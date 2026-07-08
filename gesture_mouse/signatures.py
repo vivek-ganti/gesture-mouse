@@ -65,11 +65,20 @@ FINGER_JOINTS: dict[str, tuple[int, int, int]] = {
 BUILTINS: dict[str, Signature] = {
     "pointer": {"index": "ext", "middle": "curl", "ring": "curl", "pinky": "curl"},
     "open_palm": {"index": "ext", "middle": "ext", "ring": "ext", "pinky": "ext"},
+    # The ring finger is "any" in scroll and horns, deliberately: it is the
+    # least independent finger (shared tendon with middle and pinky), so it
+    # physically CANNOT fully curl while middle is extended (scroll) or
+    # pinky is extended (horns) on most hands — requiring ring:curl there
+    # made both gestures miss for anyone whose ring hovers half-curled,
+    # which real calibration data showed (a ~24 deg ring band). Neither
+    # pose needs the ring to disambiguate: every builtin pair below is
+    # still separated by index/middle/pinky alone.
+    #
     # scroll ALSO requires dist(INDEX_TIP, MIDDLE_TIP)/scale < together_max,
     # enforced engine-side — the signature alone is deliberately reserved
     # (a captured custom gesture may not claim it; see check_conflicts).
-    "scroll": {"index": "ext", "middle": "ext", "ring": "curl", "pinky": "curl"},
-    "horns": {"index": "ext", "middle": "curl", "ring": "curl", "pinky": "ext"},
+    "scroll": {"index": "ext", "middle": "ext", "ring": "any", "pinky": "curl"},
+    "horns": {"index": "ext", "middle": "curl", "ring": "any", "pinky": "ext"},
 }
 
 # Back-compat: config entries written as {"pose": "<name>", ...} before the

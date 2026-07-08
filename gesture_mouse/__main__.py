@@ -49,7 +49,17 @@ from .panel import PanelCommand, PanelServer, frame_event
 from .preview import Preview
 from .synth import Synth, custom_action_argv, real_cursor_pos, screen_size
 from .tracker import CameraTracker, Recorder, ReplayTracker, bench_cameras, list_cameras
-from .types import EngineState, Intent, LandmarkFrame, Phase, SessionState, StateSnapshot
+from .types import (
+    INDEX_TIP,
+    MIDDLE_TIP,
+    EngineState,
+    Intent,
+    LandmarkFrame,
+    Phase,
+    SessionState,
+    StateSnapshot,
+    dist,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -674,6 +684,8 @@ class App:
             self._save_gesture(pl)
         elif t == "delete_gesture":
             self._delete_gesture(str(pl.get("name", "")))
+        elif t == "test_gesture":
+            self._test_gesture(str(pl.get("name", "")))
 
     def _shift_finger_pairs(self, delta: float) -> None:
         """Shift every per-finger calibrated extend/curl pair by delta,
@@ -889,6 +901,25 @@ class App:
         if self.ui_mode == "capturing":
             self._exit_ui_mode(reset=True)
 
+    def _test_gesture(self, name: str) -> None:
+        """Fire a saved gesture's ACTION right now, without doing the pose —
+        the panel's 'Test' button. Answers "did I bind the right action"
+        separately from "does the pose register" (the Live tab's per-finger
+        readout + hold chip answer the latter)."""
+        parsed, _ = signatures.normalize_custom_entries(self.cfg.custom_gestures)
+        entry = next((g for g in parsed if g["name"] == name), None)
+        if entry is None:
+            self._toast_msg("warn", f"no gesture named {name!r}")
+            return
+        if self.synth is None:
+            self._toast_msg("warn", "actions don't post in replay mode")
+            return
+        self.synth.execute(Intent(
+            f"custom:{name}", Phase.TRIGGER, {"action": entry["action"]},
+            self._last_ts_ms,
+        ))
+        self._toast_msg("info", f"tested {name!r} — action posted")
+
     def _delete_gesture(self, name: str) -> None:
         self._reload_config_now()   # don't clobber a pending external edit
         kept = [g for g in self.cfg.custom_gestures
@@ -945,6 +976,13 @@ class App:
             return
         lm = self.engine.smoothed_landmarks if (frame is not None
                                                 and frame.hand_present) else None
+        # Scroll's extra gate made visible: normalized index-middle fingertip
+        # distance vs scroll.together_max — without this in the Live view,
+        # "scroll won't start" is undiagnosable (the per-finger rows can all
+        # be right while the fingertips are simply too far apart).
+        together = None
+        if lm is not None and frame is not None and frame.scale > 0:
+            together = dist(lm[INDEX_TIP], lm[MIDDLE_TIP]) / frame.scale
         thresholds = {}
         for f in signatures.FINGERS:
             per = self.cfg.pose.fingers.get(f)
@@ -991,11 +1029,13 @@ class App:
                   "phase": pd.get("phase"),
                   "m": pd.get("m") if isinstance(pd.get("m"), float) else None,
                   "disp_frac": pd.get("disp_frac")
-                  if isinstance(pd.get("disp_frac"), float) else None},
+                  if isinstance(pd.get("disp_frac"), float) else None,
+                  "together": round(together, 3) if together is not None else None},
             mode=self.ui_mode,
             calibration=calibration,
             capture=capture,
             toast=toast,
+            custom_hold=self.engine.custom_hold,
         )
         self.panel.publish("frame", ev)
 

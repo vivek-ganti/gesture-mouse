@@ -114,7 +114,7 @@ def test_command_types_exact():
         "calibrate_start", "calibrate_begin_step", "calibrate_cancel",
         "calibrate_apply",
         "capture_start", "capture_cancel",
-        "save_gesture", "delete_gesture",
+        "save_gesture", "delete_gesture", "test_gesture",
     })
 
 
@@ -149,6 +149,8 @@ def test_frame_event_golden():
         calibration=None,
         capture=None,
         toast={"id": 3, "level": "info", "text": "saved"},
+        custom_hold={"name": "dictate", "held_ms": 180.0, "hold_ms": 300.0,
+                     "cooling": False},
     )
     assert out == {
         "ts": 1234.5,
@@ -182,6 +184,8 @@ def test_frame_event_golden():
         "calibration": None,
         "capture": None,
         "toast": {"id": 3, "level": "info", "text": "saved"},
+        "custom_hold": {"name": "dictate", "held_ms": 180.0, "hold_ms": 300.0,
+                        "cooling": False},
     }
     # The whole point of the shaper: what it emits must survive the SSE wire.
     assert json.loads(json.dumps(out)) == out
@@ -201,6 +205,7 @@ def test_frame_event_none_fields():
     assert out["calibration"] is None
     assert out["capture"] is None
     assert out["toast"] is None
+    assert out["custom_hold"] is None
 
 
 # ------------------------------------------------------------------- GET /

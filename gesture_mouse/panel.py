@@ -54,7 +54,7 @@ COMMAND_TYPES: frozenset[str] = frozenset({
     "calibrate_start", "calibrate_begin_step", "calibrate_cancel",
     "calibrate_apply",
     "capture_start", "capture_cancel",
-    "save_gesture", "delete_gesture",
+    "save_gesture", "delete_gesture", "test_gesture",
 })
 
 # Broadcast tuning. 66 ms ~= 15 fps: half the camera's native rate, plenty
@@ -112,6 +112,7 @@ def frame_event(
     calibration: dict | None = None,
     capture: dict | None = None,
     toast: dict | None = None,
+    custom_hold: dict | None = None,
 ) -> dict:
     """Shape one "frame" SSE event dict from primitive inputs.
 
@@ -154,6 +155,9 @@ def frame_event(
         "calibration": calibration,
         "capture": capture,
         "toast": toast,
+        # {name, held_ms, hold_ms, cooling} while a custom pose is being
+        # held — the panel's live "holding <gesture>" progress feedback.
+        "custom_hold": custom_hold,
     }
 
 

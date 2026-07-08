@@ -654,6 +654,53 @@ class TestBentJointPoseClassification:
         assert eng._open_palm_pose(lm) is False
 
 
+def test_horns_with_thumb_on_middle_fires_custom_not_right_click():
+    # The real rock sign 🤘 rests the thumb ON the curled middle fingertip —
+    # thumb-middle distance sits well inside right_engage with the index
+    # extended, a perfect fake right-pinch. Without the custom-pose gate in
+    # _tick_pinch_candidates this confirmed RIGHT_PINCH, blocked the custom
+    # loop (state gate), and fired a right CLICK on release instead of the
+    # bound action. (The user's exact "rock horns don't work" report.)
+    cfg = Config()
+    s = Seq()
+    s.hold("pointer", 400)          # clutch -> POINTER
+    s.hold("horns", 33)
+    s.pinch_middle_to(0.2, 66)      # thumb comes to rest on the middle tip
+    s.hold(ms=600)                  # hold the sign well past hold_ms=300
+    intents, _, eng = run(s.frames, cfg=cfg)
+    assert len(named(intents, "custom:dictate")) == 1
+    assert named(intents, "right") == []
+    assert eng.state is not EngineState.RIGHT_PINCH
+
+
+def test_scroll_enters_with_ring_stuck_half_extended():
+    # Anatomical regression: after an open palm latches every finger
+    # extended, the ring physically cannot fully curl while the middle
+    # stays extended — it hovers in the hysteresis band and stays latched
+    # extended. Scroll's signature must not care (ring is "any").
+    from pose_fixtures import make_bent_frame
+
+    cfg = Config()
+    pipe = CursorPipeline(cfg, *SCREEN)
+    eng = GestureEngine(cfg, pipe.pinch)
+    ts = 0.0
+
+    def feed(angles, ms):
+        nonlocal ts
+        for _ in range(max(1, round(ms / STEP_MS))):
+            f = make_bent_frame(ts, angles)
+            eng.update(f, pipe.update(f))
+            ts += STEP_MS
+
+    feed({"index": 175.0, "middle": 40.0, "ring": 40.0, "pinky": 40.0}, 400)  # clutch
+    assert eng.state is EngineState.POINTER
+    feed({"index": 175.0, "middle": 175.0, "ring": 175.0, "pinky": 175.0}, 200)  # open palm: all latch ext
+    # Two fingers up + pinky curled, ring stuck at 145 deg (between curl 130
+    # and extend 160 -> latch HOLDS its extended state from the open palm).
+    feed({"index": 175.0, "middle": 175.0, "ring": 145.0, "pinky": 40.0}, 400)
+    assert eng.state is EngineState.SCROLL
+
+
 class TestYModeLatchSync:
     def test_finger_states_truthful_in_y_extended_test_mode(self):
         # The y-mode _ext branch must keep the latches in sync — the panel

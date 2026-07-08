@@ -168,6 +168,8 @@ class GestureEngine:
         self._smoother = LandmarkSmoother(self.cfg)
         self._lm_smooth: tuple[Point, ...] | None = None
         self._finger_angles: dict[str, float] = {}
+        self._custom_pose_now = False       # hand currently matches a custom sig
+        self._custom_hold: dict | None = None   # live hold progress (panel)
         self._latches: dict[str, signatures.FingerLatch] = {
             f: signatures.FingerLatch() for f in signatures.FINGERS
         }
@@ -270,6 +272,15 @@ class GestureEngine:
         if self._right_val != inf:
             out["right"] = self._right_val
         return out
+
+    @property
+    def custom_hold(self) -> dict | None:
+        """Live custom-gesture hold progress from the last frame, or None
+        when no custom pose is being held / gates block evaluation
+        (additive to the CONTRACTS.md surface): {name, held_ms, hold_ms,
+        cooling}. Feeds the panel's 'holding <gesture>' progress chip — the
+        visible feedback loop for testing a gesture."""
+        return dict(self._custom_hold) if self._custom_hold is not None else None
 
     @property
     def smoothed_landmarks(self) -> tuple[Point, ...] | None:
@@ -507,6 +518,8 @@ class GestureEngine:
         anchor: Point | None = None
         self._lm_smooth = None
         self._finger_angles = {}
+        self._custom_pose_now = False
+        self._custom_hold = None
 
         if valid:
             lm_raw = frame.landmarks
@@ -524,6 +537,13 @@ class GestureEngine:
             self._finger_angles = signatures.compute_finger_angles(lm)
             anchor = lm_raw[INDEX_MCP]
             open_palm = self._open_palm_pose(lm)
+            # Evaluated BEFORE the state ticks: _tick_pinch_candidates reads
+            # this to suppress pinch candidacy while a custom pose is held
+            # (see the comment there for why — the rock sign fakes a
+            # thumb-middle pinch otherwise).
+            self._custom_pose_now = any(
+                self._match(g["signature"], lm) for g in self._custom
+            )
             self._left_val = self._pinch_filter(
                 "left", dist(lm_raw[THUMB_TIP], lm_raw[INDEX_TIP]) / frame.scale, ts
             )
@@ -604,6 +624,16 @@ class GestureEngine:
             assert lm is not None
             for g in self._custom:
                 since = g["hold"].update(ts, self._match(g["signature"], lm))
+                if since is not None and self._custom_hold is None:
+                    # Live hold progress for the panel ("holding 'dictate'
+                    # 60%"); cleared every frame, so it vanishes the moment
+                    # any gate above stops this loop from running.
+                    self._custom_hold = {
+                        "name": g["name"],
+                        "held_ms": ts - since,
+                        "hold_ms": g["hold_ms"],
+                        "cooling": ts < g["block_until"],
+                    }
                 if (
                     since is not None
                     and ts - since >= g["hold_ms"]
@@ -767,6 +797,20 @@ class GestureEngine:
         # Scale-stability gate: no pinch state transitions during a yaw/depth
         # transient — candidacy restarts once the hand scale settles.
         if not stable:
+            self._clear_pinch()
+            return None
+
+        # Custom-pose gate: while the hand matches a registered custom
+        # gesture's signature, pinch candidacy is suppressed entirely. The
+        # rock sign 🤘 is the canonical victim without this: the thumb
+        # naturally rests ON the curled middle fingertip, which reads as a
+        # thumb-middle distance well inside right_engage with the index
+        # clearly extended — a perfect fake right-pinch that used to preempt
+        # the custom gesture and fire a right CLICK on release instead.
+        # Safe because custom signatures are conflict-checked against every
+        # builtin at save time: a hand matching a custom pose can never
+        # simultaneously be the pointer-ish hand a real pinch starts from.
+        if self._custom_pose_now:
             self._clear_pinch()
             return None
 

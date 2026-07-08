@@ -140,7 +140,8 @@ ok/relaxed_overlap land in `cfg.pose.fingers[finger] = {extend, curl}`
 ```python
 COMMAND_TYPES  # camera_start/stop/switch, panic, quit, set_setting,
                # calibrate_start/begin_step/cancel/apply,
-               # capture_start/cancel, save_gesture, delete_gesture
+               # capture_start/cancel, save_gesture, delete_gesture,
+               # test_gesture (fire a saved gesture's ACTION now, no pose)
 @dataclass(frozen=True) class PanelCommand: type: str; payload: dict
 
 class PanelServer:
@@ -170,7 +171,10 @@ the classifier's own input), fingers {finger: {angle, ext}} (thumb ext=null),
 thresholds {finger: {extend, curl, calibrated}}, pinch {left,right},
 pinch_cfg, palm {open, phase, m, disp_frac}, mode, calibration
 (progress()+results|null), capture ({active, signature, stable_ms, done,
-conflicts}|null), toast ({id, level, text}|null, rides ~3s, dedup by id).
+conflicts}|null), toast ({id, level, text}|null, rides ~3s, dedup by id),
+custom_hold ({name, held_ms, hold_ms, cooling}|null — live custom-gesture
+hold progress). palm additionally carries "together" (normalized
+index-middle fingertip distance, scroll's extra gate, |null).
 "config" schema: settings (whitelisted dotted paths), custom_gestures
 (normalized), builtin_gestures, cameras, camera_index, calib_defaults,
 calib_steps, pose_fingers.
@@ -304,7 +308,11 @@ forwarding gate. The anchor-teleport -> HANDS_LOST guard is skipped in PALM
 - Engine: each entry's signature is tested by the same `_match` used by
   built-in poses. Held (debounced) hold_ms with a mostly-still cursor from
   CLUTCH_WAIT/POINTER, no pinch in flight -> Intent("custom:<name>", TRIGGER,
-  {"action": <dict>}) + per-gesture cooldown.
+  {"action": <dict>}) + per-gesture cooldown. While the hand matches ANY
+  custom signature, pinch candidacy is suppressed (`_custom_pose_now` gate
+  in `_tick_pinch_candidates`) — the rock sign's thumb resting on the
+  curled middle fingertip reads as a thumb-middle right-pinch otherwise
+  and would preempt the gesture with a right click.
 - Panel editor: capture-by-demonstration (signature_from_states of the live
   latches, 1s stable, conflict check vs BUILTINS + other customs) -> name +
   action form -> save_gesture command -> cfg mutation + store.save() +

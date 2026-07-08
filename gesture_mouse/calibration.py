@@ -81,15 +81,22 @@ STEPS: tuple[CalibStep, ...] = (
         "Open hand — all four fingers extended, relaxed spread.",
         {"index": "ext", "middle": "ext", "ring": "ext", "pinky": "ext"},
     ),
+    # Ring is "ignore" in the scroll and horns steps, mirroring the "any" in
+    # their signatures (signatures.BUILTINS): the ring physically cannot
+    # fully curl while its neighbor is extended (shared tendon), so sampling
+    # it as "curl" here fed genuinely-half-curled angles into its curl
+    # cluster and inflated curl_high — real calibration data showed the ring
+    # band collapsing to ~24 deg from exactly this. Its curl cluster now
+    # comes only from pointer + fist, where the ring truly folds.
     CalibStep(
         "scroll", "Two up",
         "Two fingers up, together — like a peace sign with the fingers touching.",
-        {"index": "ext", "middle": "ext", "ring": "curl", "pinky": "curl"},
+        {"index": "ext", "middle": "ext", "ring": "ignore", "pinky": "curl"},
     ),
     CalibStep(
         "horns", "Rock sign",
         "Rock sign — index and pinky up, middle and ring curled.",
-        {"index": "ext", "middle": "curl", "ring": "curl", "pinky": "ext"},
+        {"index": "ext", "middle": "curl", "ring": "ignore", "pinky": "ext"},
     ),
     CalibStep(
         "fist", "Fist",

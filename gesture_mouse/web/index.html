@@ -344,6 +344,11 @@ main{flex:1;overflow-y:auto;min-width:0}
           <div class="mlegend">bright tick = engage · faint tick = release (hysteresis)</div>
         </div>
         <div class="meter">
+          <div class="mlabel">2-finger gap <span class="chip blue">scroll needs &lt; tick</span><span class="mono" id="tog-val">–</span></div>
+          <div class="mtrack"><div class="mfill pinchf" id="tog-fill"></div><div class="mtick engage" id="tog-max"></div></div>
+          <div class="mlegend">index–middle fingertip distance: keep them touching to scroll</div>
+        </div>
+        <div class="meter">
           <div class="mlabel">palm spread <span class="chip dim" id="palm-open">closed</span><span class="mono" id="palm-val">–</span></div>
           <div class="mtrack"><div class="mfill palmf" id="palm-fill"></div></div>
         </div>
@@ -360,6 +365,7 @@ main{flex:1;overflow-y:auto;min-width:0}
         <span>latency <b id="lat" class="mono">–</b></span>
         <span class="chip red hidden" id="susp"></span>
         <span class="chip amber hidden" id="modebadge"></span>
+        <span class="chip ok hidden" id="holdchip"></span>
       </div>
     </div>
   </section>
@@ -650,6 +656,11 @@ function renderLive(){
   pinchMeter('lp', p.left, pc.left_engage, pc.left_release);
   pinchMeter('rp', p.right, pc.right_engage, pc.right_release);
   const palm = F.palm || {};
+  const tog = palm.together;
+  const togMax = (CFG && CFG.settings && CFG.settings['scroll.together_max']) || 0.45;
+  setStyle($('tog-fill'), 'width', tog == null ? '0%' : (Math.min(tog / 1.2, 1) * 100).toFixed(1) + '%');
+  setText($('tog-val'), tog == null ? '–' : tog.toFixed(2));
+  setStyle($('tog-max'), 'left', (Math.min(togMax / 1.2, 1) * 100).toFixed(1) + '%');
   const m = palm.m;
   setStyle($('palm-fill'), 'width', m == null ? '0%' : (Math.min(m / 1.4, 1) * 100).toFixed(1) + '%');
   setText($('palm-val'), m == null ? '–' : m.toFixed(2));
@@ -667,6 +678,15 @@ function renderLive(){
   const showMode = F.mode && F.mode !== 'normal';
   mb.classList.toggle('hidden', !showMode);
   if (showMode) setText(mb, F.mode);
+  // Live custom-gesture hold progress — THE feedback for "is my pose
+  // registering": fills toward 100%, then the action fires.
+  const hc = $('holdchip'), ch = F.custom_hold;
+  hc.classList.toggle('hidden', !ch);
+  if (ch){
+    const pct = Math.min(100, Math.round(100 * (ch.held_ms || 0) / (ch.hold_ms || 1)));
+    setText(hc, ch.cooling ? ch.name + ': cooldown' : 'holding ' + ch.name + ' ' + pct + '%');
+    setClass(hc, ch.cooling ? 'chip dim' : 'chip ok');
+  }
 }
 function pinchMeter(prefix, v, engage, release){
   setStyle($(prefix + '-fill'), 'width', v == null ? '0%' : (Math.min(v / 0.9, 1) * 100).toFixed(1) + '%');
@@ -815,12 +835,19 @@ function renderGestures(){
     const d = document.createElement('div');
     d.className = 'card gcard';
     d.innerHTML =
-      '<div class="gtop"><h3>' + esc(g.name) + '</h3>' +
-      '<button class="ghost danger" aria-label="delete ' + esc(g.name) + '">delete</button></div>' +
+      '<div class="gtop"><h3>' + esc(g.name) + '</h3><span>' +
+      '<button class="ghost" data-act="test" aria-label="test ' + esc(g.name) + '">test</button>' +
+      '<button class="ghost" data-act="edit" aria-label="edit ' + esc(g.name) + '">edit</button>' +
+      '<button class="ghost danger" data-act="del" aria-label="delete ' + esc(g.name) + '">delete</button>' +
+      '</span></div>' +
       glyphRow(g.signature) +
       '<p class="gdesc">' + esc(actionSummary(g.action)) + '</p>' +
       '<p class="gmeta mono">' + Math.round(g.hold_ms) + ' ms hold · ' + Math.round(g.cooldown_ms) + ' ms cooldown</p>';
-    d.querySelector('button').onclick = function(){
+    d.querySelector('[data-act="test"]').onclick = function(){
+      send('test_gesture', {name: g.name});   // fires the ACTION now, no pose needed
+    };
+    d.querySelector('[data-act="edit"]').onclick = function(){ openEdit(g); };
+    d.querySelector('[data-act="del"]').onclick = function(){
       if (confirm('Delete gesture "' + g.name + '"?')) send('delete_gesture', {name: g.name});
     };
     cu.appendChild(d);
@@ -829,7 +856,7 @@ function renderGestures(){
 
 /* ============ capture modal ============ */
 const RING_C = 201.06;  // 2*pi*32
-const cap = {open: false, phase: 'live', sig: null, glyphKey: ''};
+const cap = {open: false, phase: 'live', sig: null, glyphKey: '', editing: null};
 
 function showCapPhase(p){
   cap.phase = p;
@@ -837,8 +864,9 @@ function showCapPhase(p){
     $('cap-' + ph).classList.toggle('hidden', ph !== p);
 }
 function openCapture(){
-  cap.open = true; cap.sig = null; cap.glyphKey = '';
+  cap.open = true; cap.sig = null; cap.glyphKey = ''; cap.editing = null;
   cap.awaitFresh = true;   // ignore stale done:true frames from a prior capture
+  $('cap-modal').querySelector('.modal-head h2').textContent = 'Add gesture';
   resetCapForm();
   showCapPhase('live');
   $('cap-glyphs').innerHTML = glyphRow(null, true);
@@ -849,8 +877,9 @@ function openCapture(){
   send('capture_start');
 }
 function closeCapture(cancel){
-  if (cancel) send('capture_cancel');
+  if (cancel) send('capture_cancel');   // no-op backend-side in edit mode
   cap.open = false;
+  cap.editing = null;
   $('cap-modal').classList.remove('show');
 }
 function renderCaptureLive(){
@@ -885,12 +914,45 @@ function renderCaptureLive(){
   }
 }
 function resetCapForm(){
-  $('g-name').value = ''; $('g-key').value = ''; $('g-shell').value = '';
+  $('g-name').value = ''; $('g-name').readOnly = false;
+  $('g-key').value = ''; $('g-shell').value = '';
   $('g-shell-chips').innerHTML = ''; $('g-trigger').selectedIndex = 0;
   $('g-hold').value = '300'; $('g-cool').value = '1200';
   $('g-err').classList.add('hidden');
   for (const m of ['command','option','control','shift']) $('g-mod-' + m).checked = false;
   setActType('key');
+}
+function openEdit(g){
+  // Edit = the capture modal opened straight at the form phase, prefilled;
+  // no camera capture and no backend mode — save_gesture replaces by name.
+  // The pose itself isn't editable here (delete + re-capture for that);
+  // the name stays fixed so a rename can't half-fail into two entries.
+  cap.open = true; cap.editing = g.name; cap.sig = g.signature;
+  cap.glyphKey = ''; cap.awaitFresh = false;
+  resetCapForm();
+  $('cap-modal').querySelector('.modal-head h2').textContent = 'Edit gesture';
+  $('g-name').value = g.name; $('g-name').readOnly = true;
+  $('g-hold').value = String(Math.round(g.hold_ms));
+  $('g-cool').value = String(Math.round(g.cooldown_ms));
+  const a = g.action || {};
+  if (a.type === 'shell'){
+    setActType('shell');
+    $('g-shell').value = (a.argv || []).join(' ');
+    $('g-shell').oninput();
+  } else if (a.type === 'trigger'){
+    setActType('trigger');
+    $('g-trigger').value = a.name || $('g-trigger').value;
+  } else {
+    setActType('key');
+    $('g-key').value = a.key || '';
+    for (const m of (a.modifiers || [])){
+      const el = $('g-mod-' + m);
+      if (el) el.checked = true;
+    }
+  }
+  $('cap-form-glyphs').innerHTML = glyphRow(g.signature, true);
+  showCapPhase('form');
+  $('cap-modal').classList.add('show');
 }
 let actType = 'key';
 function setActType(t){
@@ -936,7 +998,9 @@ $('cap-save').onclick = function(){
   if (!name) return fail('name is required');
   const taken = ((CFG && CFG.custom_gestures) || []).map(function(g){ return g.name; })
     .concat(((CFG && CFG.builtin_gestures) || []).map(function(g){ return g.name; }));
-  if (taken.indexOf(name) >= 0) return fail('"' + name + '" already exists');
+  // Editing an existing gesture legitimately reuses its own name.
+  if (taken.indexOf(name) >= 0 && name !== cap.editing)
+    return fail('"' + name + '" already exists');
   if (!cap.sig) return fail('no captured pose — retry the capture');
   let action;
   if (actType === 'key'){
